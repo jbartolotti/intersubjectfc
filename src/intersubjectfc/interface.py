@@ -105,6 +105,9 @@ def run_intersubject_fc(
 
     analysis_outputs: list[dict[str, Any]] = []
     analyses = (config or {}).get("analyses", [])
+    overwrite = (config or {}).get("overwrite", False)
+    use_cache = (config or {}).get("use_cache", True)
+
     for analysis_index, analysis in enumerate(analyses, start=1):
         name = analysis.get("name")
         analysis_config = analysis.get("config", {})
@@ -116,6 +119,8 @@ def run_intersubject_fc(
                 output_root=output_root,
                 discovered_inputs=discovered_inputs,
                 config_dict=analysis_config,
+                overwrite=overwrite,
+                use_cache=use_cache,
             )
             analysis_outputs.append(result)
             logger.info("Completed analysis %s", name)

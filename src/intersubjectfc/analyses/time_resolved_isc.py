@@ -439,7 +439,7 @@ def _create_group_figures(
         ax.grid(True, alpha=0.3)
 
         fig_path = analysis_dir / f"roi-{roi_label}_group-{comparison_group}_approach-{approach}_figure.png"
-        fig.savefig(fig_path, dpi=100, bbox_inches="tight")
+        fig.savefig(fig_path, dpi=200, bbox_inches="tight")
         plt.close(fig)
         figure_paths.append(fig_path)
 
@@ -463,6 +463,8 @@ def run_time_resolved_isc_analysis(
     output_root: Path,
     discovered_inputs: dict[str, Any],
     config_dict: dict[str, Any],
+    overwrite: bool = False,
+    use_cache: bool = True,
 ) -> dict[str, Any]:
     """Run centered-window time-resolved ISC for one scalar timeseries per subject."""
     config = TimeResolvedISCConfig(
@@ -617,10 +619,24 @@ def run_time_resolved_isc_analysis(
     analysis_dir = output_root / "time_resolved_isc"
     analysis_dir.mkdir(parents=True, exist_ok=True)
     roi_label = _safe_name(config.roi_name) if config.roi_name else "all"
-    
-    # Create group output folder
+
     group_dir = analysis_dir / "group"
     group_dir.mkdir(parents=True, exist_ok=True)
+
+    # Cache check: if use_cache is True and overwrite is False, skip if outputs exist
+    if use_cache and not overwrite:
+        metadata_path = group_dir / f"roi-{roi_label}_approach-{config.approach}_timeseries_metadata.json"
+        if metadata_path.exists():
+            logger.info("Cache hit: skipping analysis for roi=%s, approach=%s", config.roi_name, config.approach)
+            return {
+                "analysis": "time_resolved_isc",
+                "status": "skipped_cache",
+                "roi_name": config.roi_name,
+                "roi_label": roi_label,
+                "approach": config.approach,
+                "output_root": str(analysis_dir),
+                "message": f"Using cached outputs from {analysis_dir}",
+            }
 
     outputs: dict[str, Any] = {
         "analysis": "time_resolved_isc",
@@ -667,22 +683,33 @@ def run_time_resolved_isc_analysis(
                     means, sems = type_dict[comparison_type]
                     for tr_idx, (mean_val, sem_val) in enumerate(zip(means, sems)):
                         if not np.isnan(mean_val):
-                            avg_df = pd.concat([
-                                avg_df,
-                                pd.DataFrame([{
-                                    "comparison_group": comparison_group,
-                                    "comparison_type": comparison_type,
-                                    "tr": tr_idx,
-                                    "mean": mean_val,
-                                    "sem": sem_val,
-                                }])
-                            ], ignore_index=True)
+                            avg_df = pd.concat(
+                                [
+                                    avg_df,
+                                    pd.DataFrame(
+                                        [
+                                            {
+                                                "comparison_group": comparison_group,
+                                                "comparison_type": comparison_type,
+                                                "tr": tr_idx,
+                                                "mean": mean_val,
+                                                "sem": sem_val,
+                                            }
+                                        ]
+                                    ),
+                                ],
+                                ignore_index=True,
+                            )
             avg_df.to_csv(avg_path, sep="\t", index=False, na_rep="")
             outputs["files"]["loso_group_averages"] = str(avg_path)
 
             fig_paths = _create_group_figures(
-                averages, group_dir, roi_label, "loso",
-                event_seconds=config.event_seconds, tr_seconds=config.tr_seconds
+                averages,
+                group_dir,
+                roi_label,
+                "loso",
+                event_seconds=config.event_seconds,
+                tr_seconds=config.tr_seconds,
             )
             outputs["files"]["loso_figures"] = [str(p) for p in fig_paths]
             logger.info("Generated %d LOSO figures", len(fig_paths))
@@ -717,22 +744,33 @@ def run_time_resolved_isc_analysis(
                     means, sems = type_dict[comparison_type]
                     for tr_idx, (mean_val, sem_val) in enumerate(zip(means, sems)):
                         if not np.isnan(mean_val):
-                            avg_df = pd.concat([
-                                avg_df,
-                                pd.DataFrame([{
-                                    "comparison_group": comparison_group,
-                                    "comparison_type": comparison_type,
-                                    "tr": tr_idx,
-                                    "mean": mean_val,
-                                    "sem": sem_val,
-                                }])
-                            ], ignore_index=True)
+                            avg_df = pd.concat(
+                                [
+                                    avg_df,
+                                    pd.DataFrame(
+                                        [
+                                            {
+                                                "comparison_group": comparison_group,
+                                                "comparison_type": comparison_type,
+                                                "tr": tr_idx,
+                                                "mean": mean_val,
+                                                "sem": sem_val,
+                                            }
+                                        ]
+                                    ),
+                                ],
+                                ignore_index=True,
+                            )
             avg_df.to_csv(avg_path, sep="\t", index=False, na_rep="")
             outputs["files"]["pairwise_group_averages"] = str(avg_path)
 
             fig_paths = _create_group_figures(
-                averages, group_dir, roi_label, "pairwise",
-                event_seconds=config.event_seconds, tr_seconds=config.tr_seconds
+                averages,
+                group_dir,
+                roi_label,
+                "pairwise",
+                event_seconds=config.event_seconds,
+                tr_seconds=config.tr_seconds,
             )
             outputs["files"]["pairwise_figures"] = [str(p) for p in fig_paths]
             logger.info("Generated %d pairwise figures", len(fig_paths))
@@ -744,8 +782,9 @@ def run_time_resolved_isc_analysis(
         pairwise_df.to_csv(pairwise_path, sep="\t", index=False, na_rep="")
         outputs["files"]["pairwise_details"] = str(pairwise_path)
 
-    metadata_path = analysis_dir / f"time_resolved_isc_roi-{roi_label}_metadata.json"
+    metadata_path = group_dir / f"roi-{roi_label}_approach-{config.approach}_timeseries_metadata.json"
     metadata = {
+        "analysis": "time_resolved_isc",
         "config": {
             "window_size_trs": config.window_size_trs,
             "min_samples": config.min_samples,
@@ -760,9 +799,10 @@ def run_time_resolved_isc_analysis(
             "event_seconds": config.event_seconds,
             "tr_seconds": config.tr_seconds,
         },
-        "subjects": subjects,
-        "subject_timecourse_files": {subject: str(path) for subject, path in subject_to_file.items()},
-        "comparison_sets": comparison_sets,
+        "n_subjects": len(subjects),
+        "n_timepoints": n_timepoints,
+        "comparison_sets": sorted(comparison_sets.keys()),
+        "files": outputs["files"],
     }
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     outputs["files"]["metadata"] = str(metadata_path)
