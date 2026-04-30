@@ -547,18 +547,47 @@ def run_ispc_analysis(
     # Load ROI mask aligned to the first subject's brain grid.
     logger.info("Loading ROI mask: %s", config.roi_mask)
     mask_flat = _load_roi_mask_for_reference(config.roi_mask, subject_to_file[subjects[0]])
-    logger.info("Mask contains %d voxels", int(np.sum(mask_flat)))
+    n_mask_voxels = int(np.sum(mask_flat))
+    logger.info("Mask contains %d voxels", n_mask_voxels)
 
-    # Load 4D data for all subjects.
-    subject_data: dict[str, np.ndarray] = {}
+    # Extract each subject ROI matrix to disk so we do not keep full 4D data in RAM.
+    roi_cache_dir = analysis_dir / "_roi_cache" / f"roi-{roi_label}"
+    roi_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    subject_roi_paths: dict[str, Path] = {}
     n_timepoints_per_subject: dict[str, int] = {}
+    voxel_keep_mask: np.ndarray | None = None
 
     for idx, subject in enumerate(subjects, start=1):
         brain_file = subject_to_file[subject]
-        logger.info("Loading 4D brain %d/%d: %s from %s", idx, len(subjects), subject, brain_file)
-        data = _load_4d_brain(brain_file, mask_flat)   # (n_trs, n_voxels)
-        subject_data[subject] = data
-        n_timepoints_per_subject[subject] = data.shape[0]
+        roi_path = roi_cache_dir / f"{subject}_roi-{roi_label}_matrix.npy"
+        var_path = roi_cache_dir / f"{subject}_roi-{roi_label}_varmask.npy"
+
+        subject_roi_paths[subject] = roi_path
+        use_cached_roi = (not overwrite) and roi_path.exists() and var_path.exists()
+
+        if use_cached_roi:
+            roi_data = np.load(roi_path, mmap_mode="r")
+            var_mask = np.load(var_path)
+            if roi_data.ndim != 2 or roi_data.shape[1] != n_mask_voxels or var_mask.shape[0] != n_mask_voxels:
+                logger.warning("Cached ROI matrix shape mismatch for %s; rebuilding cache", subject)
+                use_cached_roi = False
+            else:
+                n_timepoints_per_subject[subject] = int(roi_data.shape[0])
+
+        if not use_cached_roi:
+            logger.info("Extracting ROI matrix %d/%d: %s from %s", idx, len(subjects), subject, brain_file)
+            roi_data = _load_4d_brain(brain_file, mask_flat).astype(np.float32, copy=False)
+            np.save(roi_path, roi_data)
+            var_mask = np.nanvar(roi_data, axis=0) > 0.0
+            np.save(var_path, var_mask.astype(np.bool_))
+            n_timepoints_per_subject[subject] = int(roi_data.shape[0])
+            del roi_data
+
+        if voxel_keep_mask is None:
+            voxel_keep_mask = np.asarray(var_mask, dtype=bool)
+        else:
+            voxel_keep_mask &= np.asarray(var_mask, dtype=bool)
 
     unique_lengths = sorted(set(n_timepoints_per_subject.values()))
     if len(unique_lengths) != 1:
@@ -568,8 +597,19 @@ def run_ispc_analysis(
     n_timepoints = unique_lengths[0]
     logger.info("All subjects have %d TRs", n_timepoints)
 
-    # Exclude zero-variance voxels (across time, consistent across subjects).
-    subject_data, n_voxels_kept = _exclude_zero_variance_voxels(subject_data)
+    if voxel_keep_mask is None:
+        raise ValueError("Failed to compute voxel keep mask for ISPC.")
+
+    kept_voxel_indices = np.where(voxel_keep_mask)[0]
+    n_voxels_kept = int(kept_voxel_indices.shape[0])
+    if n_voxels_kept == 0:
+        raise ValueError("No non-zero-variance voxels remained after subject intersection.")
+    if n_voxels_kept < n_mask_voxels:
+        logger.info(
+            "Excluding %d zero-variance voxels (%d retained)",
+            n_mask_voxels - n_voxels_kept,
+            n_voxels_kept,
+        )
 
     # Load censor masks.
     subject_censor: dict[str, np.ndarray] = {}
@@ -589,6 +629,25 @@ def run_ispc_analysis(
     groups = _load_groups(participants_tsv_path=participants_path, group_column=config.group_column)
     comparison_sets = _build_comparison_sets(subjects=subjects, groups=groups)
     logger.info("Comparison sets: %s", sorted(comparison_sets.keys()))
+
+    # For LOSO, precompute per-set sum patterns and contributing subject counts at each TR.
+    loso_set_sums: dict[str, np.ndarray] = {}
+    loso_set_counts: dict[str, np.ndarray] = {}
+    if config.approach == "loso":
+        for set_name, set_subjects in comparison_sets.items():
+            set_sums = np.zeros((n_timepoints, n_voxels_kept), dtype=np.float32)
+            set_counts = np.zeros(n_timepoints, dtype=np.int32)
+
+            for set_subject in set_subjects:
+                roi_data = np.load(subject_roi_paths[set_subject], mmap_mode="r")
+                roi_kept = np.asarray(roi_data[:, kept_voxel_indices], dtype=np.float32)
+                valid = subject_censor[set_subject]
+                if np.any(valid):
+                    set_sums[valid] += roi_kept[valid]
+                    set_counts[valid] += 1
+
+            loso_set_sums[set_name] = set_sums
+            loso_set_counts[set_name] = set_counts
 
     # Initialise summary arrays.
     loso_summary: dict[str, dict[str, np.ndarray]] = {
@@ -638,7 +697,8 @@ def run_ispc_analysis(
             continue
 
         logger.info("Computing ISPC for subject %d/%d: %s", subject_index, len(subjects), subject)
-        target_data = subject_data[subject]  # (n_trs, n_voxels)
+        target_roi_data = np.load(subject_roi_paths[subject], mmap_mode="r")
+        target_data = np.asarray(target_roi_data[:, kept_voxel_indices], dtype=np.float32)
         target_censor = subject_censor[subject]
 
         for set_name, set_subjects in comparison_sets.items():
@@ -647,34 +707,44 @@ def run_ispc_analysis(
                 continue
 
             if config.approach == "loso":
-                # Build LOSO group mean spatial pattern at each TR.
+                set_sums = loso_set_sums[set_name]
+                set_counts = loso_set_counts[set_name]
+                subject_in_set = subject in set_subjects
+
                 for tr in range(n_timepoints):
                     if not target_censor[tr]:
                         continue
 
-                    eligible: list[np.ndarray] = []
-                    for cs in comparison_subjects:
-                        if subject_censor[cs][tr]:
-                            eligible.append(subject_data[cs][tr])
-
-                    if not eligible:
+                    subtract_self = subject_in_set and bool(target_censor[tr])
+                    n_other = int(set_counts[tr]) - (1 if subtract_self else 0)
+                    if n_other <= 0:
                         continue
 
-                    group_pattern = np.mean(np.vstack(eligible), axis=0)
+                    if subtract_self:
+                        group_pattern = (set_sums[tr] - target_data[tr]) / float(n_other)
+                    else:
+                        group_pattern = set_sums[tr] / float(n_other)
+
                     corr = _pearson_corr(target_data[tr], group_pattern)
                     loso_summary[set_name][subject][tr] = corr
 
             elif config.approach == "pairwise":
-                for tr in range(n_timepoints):
-                    if not target_censor[tr]:
-                        continue
+                z_sums = np.zeros(n_timepoints, dtype=np.float64)
+                z_counts = np.zeros(n_timepoints, dtype=np.int32)
 
-                    z_vals: list[float] = []
-                    for cs in comparison_subjects:
-                        if not subject_censor[cs][tr]:
+                for cs in comparison_subjects:
+                    cs_roi_data = np.load(subject_roi_paths[cs], mmap_mode="r")
+                    cs_data = np.asarray(cs_roi_data[:, kept_voxel_indices], dtype=np.float32)
+                    cs_censor = subject_censor[cs]
+
+                    for tr in range(n_timepoints):
+                        if not target_censor[tr]:
+                            continue
+
+                        if not cs_censor[tr]:
                             fisher_z = float("nan")
                         else:
-                            corr = _pearson_corr(target_data[tr], subject_data[cs][tr])
+                            corr = _pearson_corr(target_data[tr], cs_data[tr])
                             fisher_z = _fisher_z(corr) if np.isfinite(corr) else float("nan")
 
                         pairwise_rows.append({
@@ -686,10 +756,13 @@ def run_ispc_analysis(
                         })
 
                         if np.isfinite(fisher_z):
-                            z_vals.append(fisher_z)
+                            z_sums[tr] += fisher_z
+                            z_counts[tr] += 1
 
-                    if z_vals:
-                        pairwise_summary[set_name][subject][tr] = float(np.mean(z_vals))
+                valid_mean = z_counts > 0
+                pairwise_summary[set_name][subject][valid_mean] = (
+                    z_sums[valid_mean] / z_counts[valid_mean]
+                )
 
         # Write this subject's output immediately.
         summary = loso_summary if config.approach == "loso" else pairwise_summary
