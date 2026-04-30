@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .analyses import run_time_resolved_isc_analysis
+from .analyses import run_time_resolved_isc_analysis, run_ispc_analysis
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +123,16 @@ def run_intersubject_fc(
             )
             analysis_outputs.append(result)
             logger.info("Completed analysis %s", name)
+            elif name == "intersubject_pattern_correlation":
+                result = run_ispc_analysis(
+                    bids_root=bids_root,
+                    output_root=output_root,
+                    discovered_inputs=discovered_inputs,
+                    config_dict=analysis_config,
+                    overwrite=overwrite,
+                )
+                analysis_outputs.append(result)
+                logger.info("Completed analysis %s", name)
         else:
             analysis_outputs.append(
                 {
