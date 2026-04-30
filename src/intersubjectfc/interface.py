@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .analyses import run_time_resolved_isc_analysis
+
+logger = logging.getLogger(__name__)
 
 
 def _ensure_derivative_layout(bids_root: Path, derivative_name: str) -> Path:
@@ -81,19 +84,31 @@ def run_intersubject_fc(
     dict
         Metadata describing discovered paths and output locations.
     """
+    root_logger = logging.getLogger()
+    if not root_logger.handlers:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+
     bids_root = Path(bids_root).expanduser().resolve()
     if not bids_root.exists():
         raise FileNotFoundError(f"BIDS root does not exist: {bids_root}")
 
+    logger.info("Starting intersubjectfc run at %s", bids_root)
+
     discovered_inputs = _discover_bids_inputs(bids_root=bids_root)
+    logger.info(
+        "Discovered %d subject directories in BIDS input",
+        discovered_inputs.get("n_subject_directories", 0),
+    )
     output_root = _ensure_derivative_layout(bids_root=bids_root, derivative_name=derivative_name)
     description_path = _write_dataset_description(output_root=output_root)
+    logger.info("Writing outputs under %s", output_root)
 
     analysis_outputs: list[dict[str, Any]] = []
     analyses = (config or {}).get("analyses", [])
-    for analysis in analyses:
+    for analysis_index, analysis in enumerate(analyses, start=1):
         name = analysis.get("name")
         analysis_config = analysis.get("config", {})
+        logger.info("Running analysis %d/%d: %s", analysis_index, len(analyses), name)
 
         if name == "time_resolved_isc":
             result = run_time_resolved_isc_analysis(
@@ -103,6 +118,7 @@ def run_intersubject_fc(
                 config_dict=analysis_config,
             )
             analysis_outputs.append(result)
+            logger.info("Completed analysis %s", name)
         else:
             analysis_outputs.append(
                 {
@@ -111,6 +127,7 @@ def run_intersubject_fc(
                     "reason": "Analysis is not yet implemented.",
                 }
             )
+            logger.warning("Skipped unimplemented analysis: %s", name)
 
     run_info = {
         "package": "intersubjectfc",
@@ -125,4 +142,5 @@ def run_intersubject_fc(
     }
 
     (output_root / "run_info.json").write_text(json.dumps(run_info, indent=2), encoding="utf-8")
+    logger.info("Run finished. Metadata written to %s", output_root / "run_info.json")
     return run_info

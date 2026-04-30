@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
 from dataclasses import dataclass
@@ -13,6 +14,7 @@ import numpy as np
 import pandas as pd
 
 _SUBJECT_RE = re.compile(r"sub-[A-Za-z0-9]+")
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -301,12 +303,20 @@ def run_time_resolved_isc_analysis(
 
     required_samples = _required_samples(config.min_samples, config.window_size_trs)
     subject_to_file = _find_timecourse_files(bids_root=bids_root, config=config)
+    logger.info(
+        "time_resolved_isc starting with approach=%s, window_size_trs=%d, required_samples=%d",
+        config.approach,
+        config.window_size_trs,
+        required_samples,
+    )
 
     subjects = sorted(subject_to_file)
+    logger.info("Found %d participant timeseries files", len(subjects))
     subject_series: dict[str, np.ndarray] = {}
     subject_valid_mask: dict[str, np.ndarray] = {}
 
-    for subject in subjects:
+    for subject_index, subject in enumerate(subjects, start=1):
+        logger.info("Loading participant %d/%d: %s", subject_index, len(subjects), subject)
         series = _read_timecourse_column(subject_to_file[subject], roi_name=config.roi_name)
         subject_series[subject] = series
 
@@ -317,7 +327,8 @@ def run_time_resolved_isc_analysis(
 
     n_timepoints = unique_lengths[0]
 
-    for subject in subjects:
+    for subject_index, subject in enumerate(subjects, start=1):
+        logger.info("Preparing censor mask %d/%d: %s", subject_index, len(subjects), subject)
         series = subject_series[subject]
         censor_file = _find_censor_file(subject_to_file[subject])
         if censor_file is not None:
@@ -345,6 +356,7 @@ def run_time_resolved_isc_analysis(
         group_column=config.group_column,
     )
     comparison_sets = _build_comparison_sets(subjects=subjects, groups=groups)
+    logger.info("Using %d comparison sets: %s", len(comparison_sets), sorted(comparison_sets.keys()))
 
     loso_summary: dict[str, dict[str, np.ndarray]] = {
         name: {subject: np.full(n_timepoints, np.nan, dtype=float) for subject in subjects}
@@ -356,14 +368,15 @@ def run_time_resolved_isc_analysis(
     }
     pairwise_rows: list[dict[str, Any]] = []
 
-    for tr in range(n_timepoints):
-        start, end = _window_bounds(center_tr=tr, window_size_trs=config.window_size_trs)
-        if start < 0 or end > n_timepoints:
-            continue
-        if not _window_within_run(start=start, end=end, run_boundaries=run_boundaries):
-            continue
+    for subject_index, subject in enumerate(subjects, start=1):
+        logger.info("Computing ISC for participant %d/%d: %s", subject_index, len(subjects), subject)
+        for tr in range(n_timepoints):
+            start, end = _window_bounds(center_tr=tr, window_size_trs=config.window_size_trs)
+            if start < 0 or end > n_timepoints:
+                continue
+            if not _window_within_run(start=start, end=end, run_boundaries=run_boundaries):
+                continue
 
-        for subject in subjects:
             target_window = subject_series[subject][start:end]
             target_valid = subject_valid_mask[subject][start:end]
             if int(np.sum(target_valid)) < required_samples:
@@ -477,5 +490,7 @@ def run_time_resolved_isc_analysis(
     }
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     outputs["files"]["metadata"] = str(metadata_path)
+
+    logger.info("time_resolved_isc finished. Outputs written to %s", analysis_dir)
 
     return outputs
