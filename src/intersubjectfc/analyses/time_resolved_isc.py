@@ -464,7 +464,6 @@ def run_time_resolved_isc_analysis(
     discovered_inputs: dict[str, Any],
     config_dict: dict[str, Any],
     overwrite: bool = False,
-    use_cache: bool = True,
 ) -> dict[str, Any]:
     """Run centered-window time-resolved ISC for one scalar timeseries per subject."""
     config = TimeResolvedISCConfig(
@@ -483,6 +482,27 @@ def run_time_resolved_isc_analysis(
 
     if config.approach not in {"loso", "pairwise"}:
         raise ValueError("time_resolved_isc approach must be 'loso' or 'pairwise'.")
+
+    analysis_dir = output_root / "time_resolved_isc"
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+    roi_label = _safe_name(config.roi_name) if config.roi_name else "all"
+    group_dir = analysis_dir / "group"
+    group_dir.mkdir(parents=True, exist_ok=True)
+
+    # Default behavior: reuse cache unless overwrite is explicitly enabled.
+    metadata_path = group_dir / f"roi-{roi_label}_approach-{config.approach}_timeseries_metadata.json"
+    if not overwrite and metadata_path.exists():
+        logger.info("Cache hit: skipping analysis for roi=%s, approach=%s", config.roi_name, config.approach)
+        return {
+            "analysis": "time_resolved_isc",
+            "status": "skipped_cache",
+            "roi_name": config.roi_name,
+            "roi_label": roi_label,
+            "approach": config.approach,
+            "group_dir": str(group_dir),
+            "files": {"metadata": str(metadata_path)},
+            "message": f"Using cached outputs from {analysis_dir}",
+        }
 
     required_samples = _required_samples(config.min_samples, config.window_size_trs)
     subject_to_file = _find_timecourse_files(bids_root=bids_root, config=config)
@@ -615,28 +635,6 @@ def run_time_resolved_isc_analysis(
 
                     if pairwise_z_values:
                         pairwise_summary[set_name][subject][tr] = float(np.mean(pairwise_z_values))
-
-    analysis_dir = output_root / "time_resolved_isc"
-    analysis_dir.mkdir(parents=True, exist_ok=True)
-    roi_label = _safe_name(config.roi_name) if config.roi_name else "all"
-
-    group_dir = analysis_dir / "group"
-    group_dir.mkdir(parents=True, exist_ok=True)
-
-    # Cache check: if use_cache is True and overwrite is False, skip if outputs exist
-    if use_cache and not overwrite:
-        metadata_path = group_dir / f"roi-{roi_label}_approach-{config.approach}_timeseries_metadata.json"
-        if metadata_path.exists():
-            logger.info("Cache hit: skipping analysis for roi=%s, approach=%s", config.roi_name, config.approach)
-            return {
-                "analysis": "time_resolved_isc",
-                "status": "skipped_cache",
-                "roi_name": config.roi_name,
-                "roi_label": roi_label,
-                "approach": config.approach,
-                "output_root": str(analysis_dir),
-                "message": f"Using cached outputs from {analysis_dir}",
-            }
 
     outputs: dict[str, Any] = {
         "analysis": "time_resolved_isc",
