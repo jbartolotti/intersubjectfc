@@ -24,6 +24,7 @@ class TimeResolvedISCConfig:
     approach: str = "loso"
     run_boundaries: list[list[int]] | None = None
     group_column: str | None = None
+    roi_name: str | None = None
     timecourse_glob: str | None = None
     timecourse_files: dict[str, str] | None = None
 
@@ -74,25 +75,77 @@ def _pearson_corr(x: np.ndarray, y: np.ndarray) -> float:
     return float(np.corrcoef(x, y)[0, 1])
 
 
-def _read_single_column_timecourse(path: Path) -> np.ndarray:
+def _split_fields(raw_line: str) -> list[str]:
+    if "\t" in raw_line:
+        return raw_line.split("\t")
+    if "," in raw_line:
+        return raw_line.split(",")
+    return raw_line.strip().split()
+
+
+def _is_numeric_or_na_token(token: str) -> bool:
+    stripped = token.strip()
+    if stripped == "":
+        return True
+    if stripped.lower() in {"na", "nan", "null", "none", "."}:
+        return True
+    try:
+        float(stripped)
+        return True
+    except ValueError:
+        return False
+
+
+def _token_to_float(token: str, path: Path, raw_line: str) -> float:
+    stripped = token.strip()
+    if stripped == "" or stripped.lower() in {"na", "nan", "null", "none", "."}:
+        return float("nan")
+    try:
+        return float(stripped)
+    except ValueError as exc:
+        raise ValueError(f"Unable to parse numeric value in {path}: {raw_line}") from exc
+
+
+def _read_timecourse_column(path: Path, roi_name: str | None = None) -> np.ndarray:
     values: list[float] = []
-    text = path.read_text(encoding="utf-8")
-    for raw_line in text.splitlines():
-        stripped = raw_line.strip()
-        if stripped == "":
+    lines = path.read_text(encoding="utf-8").splitlines()
+
+    first_non_empty_idx = next((idx for idx, line in enumerate(lines) if line.strip() != ""), None)
+    if first_non_empty_idx is None:
+        return np.asarray(values, dtype=float)
+
+    first_fields = _split_fields(lines[first_non_empty_idx])
+    has_header = any(not _is_numeric_or_na_token(field) for field in first_fields)
+
+    column_index = 0
+    data_start_idx = first_non_empty_idx
+    if has_header:
+        header_fields = [field.strip() for field in first_fields]
+        if roi_name is None:
+            if len(header_fields) == 1:
+                column_index = 0
+            else:
+                raise ValueError(
+                    f"Header detected in {path} with multiple columns. "
+                    "Set time_resolved_isc config 'roi_name' to select a column."
+                )
+        else:
+            if roi_name not in header_fields:
+                raise ValueError(
+                    f"roi_name '{roi_name}' not found in header columns for {path}: {header_fields}"
+                )
+            column_index = header_fields.index(roi_name)
+
+        data_start_idx = first_non_empty_idx + 1
+
+    for raw_line in lines[data_start_idx:]:
+        if raw_line.strip() == "":
             values.append(float("nan"))
             continue
 
-        normalized = stripped.replace(",", " ").replace("\t", " ")
-        token = normalized.split()[0]
-        if token.lower() in {"na", "nan", "null", "none", "."}:
-            values.append(float("nan"))
-            continue
-
-        try:
-            values.append(float(token))
-        except ValueError as exc:
-            raise ValueError(f"Unable to parse numeric value in {path}: {raw_line}") from exc
+        fields = _split_fields(raw_line)
+        token = fields[column_index] if column_index < len(fields) else ""
+        values.append(_token_to_float(token=token, path=path, raw_line=raw_line))
 
     return np.asarray(values, dtype=float)
 
@@ -238,6 +291,7 @@ def run_time_resolved_isc_analysis(
         approach=str(config_dict.get("approach", "loso")).lower(),
         run_boundaries=config_dict.get("run_boundaries"),
         group_column=config_dict.get("group_column"),
+        roi_name=config_dict.get("roi_name"),
         timecourse_glob=config_dict.get("timecourse_glob"),
         timecourse_files=config_dict.get("timecourse_files"),
     )
@@ -253,7 +307,7 @@ def run_time_resolved_isc_analysis(
     subject_valid_mask: dict[str, np.ndarray] = {}
 
     for subject in subjects:
-        series = _read_single_column_timecourse(subject_to_file[subject])
+        series = _read_timecourse_column(subject_to_file[subject], roi_name=config.roi_name)
         subject_series[subject] = series
 
     series_lengths = {subject: ts.shape[0] for subject, ts in subject_series.items()}
@@ -267,7 +321,7 @@ def run_time_resolved_isc_analysis(
         series = subject_series[subject]
         censor_file = _find_censor_file(subject_to_file[subject])
         if censor_file is not None:
-            censor_values = _read_single_column_timecourse(censor_file)
+            censor_values = _read_timecourse_column(censor_file)
             if censor_values.shape[0] != n_timepoints:
                 raise ValueError(
                     f"Censor length mismatch for {subject}: {censor_file} has {censor_values.shape[0]} rows, "
@@ -368,9 +422,12 @@ def run_time_resolved_isc_analysis(
 
     analysis_dir = output_root / "time_resolved_isc"
     analysis_dir.mkdir(parents=True, exist_ok=True)
+    roi_label = _safe_name(config.roi_name) if config.roi_name else "all"
 
     outputs: dict[str, Any] = {
         "analysis": "time_resolved_isc",
+        "roi_name": config.roi_name,
+        "roi_label": roi_label,
         "approach": config.approach,
         "window_size_trs": config.window_size_trs,
         "required_samples": required_samples,
@@ -382,23 +439,26 @@ def run_time_resolved_isc_analysis(
 
     if config.approach == "loso":
         for set_name, set_series in loso_summary.items():
-            out_name = f"desc-{_safe_name(set_name)}_approach-loso_timeseries.tsv"
+            out_name = f"desc-{_safe_name(set_name)}_roi-{roi_label}_approach-loso_timeseries.tsv"
             out_path = analysis_dir / out_name
             _series_to_wide_df(set_series).to_csv(out_path, sep="\t", index=False, na_rep="")
             outputs["files"][f"loso_{set_name}"] = str(out_path)
 
     if config.approach == "pairwise":
         for set_name, set_series in pairwise_summary.items():
-            out_name = f"desc-{_safe_name(set_name)}_approach-pairwise_timeseries.tsv"
+            out_name = f"desc-{_safe_name(set_name)}_roi-{roi_label}_approach-pairwise_timeseries.tsv"
             out_path = analysis_dir / out_name
             _series_to_wide_df(set_series).to_csv(out_path, sep="\t", index=False, na_rep="")
             outputs["files"][f"pairwise_mean_{set_name}"] = str(out_path)
 
-        pairwise_path = analysis_dir / "desc-pairwise_details.tsv"
-        pd.DataFrame(pairwise_rows).to_csv(pairwise_path, sep="\t", index=False, na_rep="")
+        pairwise_path = analysis_dir / f"desc-pairwise_roi-{roi_label}_details.tsv"
+        pairwise_df = pd.DataFrame(pairwise_rows)
+        if not pairwise_df.empty:
+            pairwise_df["roi_name"] = config.roi_name if config.roi_name is not None else "all"
+        pairwise_df.to_csv(pairwise_path, sep="\t", index=False, na_rep="")
         outputs["files"]["pairwise_details"] = str(pairwise_path)
 
-    metadata_path = analysis_dir / "time_resolved_isc_metadata.json"
+    metadata_path = analysis_dir / f"time_resolved_isc_roi-{roi_label}_metadata.json"
     metadata = {
         "config": {
             "window_size_trs": config.window_size_trs,
@@ -407,6 +467,7 @@ def run_time_resolved_isc_analysis(
             "approach": config.approach,
             "run_boundaries": config.run_boundaries,
             "group_column": config.group_column,
+            "roi_name": config.roi_name,
             "timecourse_glob": config.timecourse_glob,
             "timecourse_files": config.timecourse_files,
         },
