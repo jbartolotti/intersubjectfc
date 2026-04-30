@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
@@ -29,6 +30,7 @@ class TimeResolvedISCConfig:
     roi_name: str | None = None
     timecourse_glob: str | None = None
     timecourse_files: dict[str, str] | None = None
+    make_figures: bool = True
 
 
 def _safe_name(value: str) -> str:
@@ -261,11 +263,169 @@ def _build_comparison_sets(subjects: list[str], groups: dict[str, str]) -> dict[
 
     for group_name in unique_groups:
         group_subjects = [s for s in subjects if groups.get(s) == group_name]
-        not_group_subjects = [s for s in subjects if groups.get(s) != group_name]
-        comparison_sets[f"group-{_safe_name(group_name)}"] = group_subjects
-        comparison_sets[f"not-group-{_safe_name(group_name)}"] = not_group_subjects
+        comparison_sets[_safe_name(group_name)] = group_subjects
 
     return comparison_sets
+
+
+def _get_comparison_type(subject: str, comparison_set_name: str, groups: dict[str, str]) -> str:
+    """Determine if comparison is within-group, between-group, or full."""
+    if comparison_set_name == "full":
+        return "full"
+    subject_group = groups.get(subject, "ungrouped")
+    return "within" if _safe_name(subject_group) == comparison_set_name else "between"
+
+
+def _results_to_long_format(
+    subject_series_results: dict[str, dict[str, np.ndarray]],
+    subjects: list[str],
+    n_timepoints: int,
+    groups: dict[str, str],
+    roi_label: str,
+) -> pd.DataFrame:
+    """Convert wide-format results (subject x TR) to long format."""
+    rows: list[dict[str, Any]] = []
+
+    for subject in subjects:
+        for set_name, timeseries in subject_series_results.items():
+            timeseries_subject = timeseries[subject]
+            for tr in range(n_timepoints):
+                value = timeseries_subject[tr]
+                if not np.isnan(value):
+                    comparison_type = _get_comparison_type(subject, set_name, groups)
+                    rows.append(
+                        {
+                            "subject": subject,
+                            "tr": tr,
+                            "roi": roi_label,
+                            "comparison_group": "all" if set_name == "full" else set_name,
+                            "comparison_type": comparison_type,
+                            "value": value,
+                        }
+                    )
+
+    return pd.DataFrame(rows)
+
+
+def _compute_group_averages(
+    long_df: pd.DataFrame,
+) -> dict[str, dict[str, tuple[np.ndarray, np.ndarray]]]:
+    """Compute mean and SEM for each comparison_group/comparison_type combination.
+    
+    Returns dict mapping (comparison_group, comparison_type) to (mean, sem) arrays.
+    """
+    averages: dict[str, dict[str, tuple[np.ndarray, np.ndarray]]] = {}
+
+    if long_df.empty:
+        return averages
+
+    n_trs = long_df["tr"].max() + 1
+
+    # Group by comparison_group and comparison_type
+    group_combos = long_df.groupby(["comparison_group", "comparison_type"])
+
+    for (cg, ct), group_data in group_combos:
+        key = f"{cg}_{ct}"
+        values_by_tr = [[] for _ in range(n_trs)]
+
+        for _, row in group_data.iterrows():
+            values_by_tr[int(row["tr"])].append(row["value"])
+
+        means = np.zeros(n_trs)
+        sems = np.zeros(n_trs)
+
+        for tr_idx, values in enumerate(values_by_tr):
+            if values:
+                means[tr_idx] = np.mean(values)
+                sems[tr_idx] = np.std(values) / np.sqrt(len(values))
+            else:
+                means[tr_idx] = np.nan
+                sems[tr_idx] = np.nan
+
+        if cg not in averages:
+            averages[cg] = {}
+        averages[cg][ct] = (means, sems)
+
+    return averages
+
+
+def _save_group_averages_tsv(
+    averages: dict[str, dict[str, tuple[np.ndarray, np.ndarray]]],
+    analysis_dir: Path,
+    roi_label: str,
+    approach: str,
+) -> Path:
+    """Save group averages to a TSV file."""
+    rows: list[dict[str, Any]] = []
+
+    for comparison_group, type_dict in sorted(averages.items()):
+        for comparison_type, (means, sems) in sorted(type_dict.items()):
+            for tr_idx, (mean_val, sem_val) in enumerate(zip(means, sems)):
+                if not np.isnan(mean_val):
+                    rows.append(
+                        {
+                            "comparison_group": comparison_group,
+                            "comparison_type": comparison_type,
+                            "tr": tr_idx,
+                            "mean": mean_val,
+                            "sem": sem_val,
+                        }
+                    )
+
+    df = pd.DataFrame(rows)
+    out_path = analysis_dir / f"roi-{roi_label}_approach-{approach}_group_averages.tsv"
+    df.to_csv(out_path, sep="\t", index=False, na_rep="")
+    return out_path
+
+
+def _create_group_figures(
+    averages: dict[str, dict[str, tuple[np.ndarray, np.ndarray]]],
+    analysis_dir: Path,
+    roi_label: str,
+    approach: str,
+) -> list[Path]:
+    """Create PNG figures for each comparison_group showing all comparison_types.
+    
+    Returns list of created figure paths.
+    """
+    figure_paths: list[Path] = []
+
+    for comparison_group in sorted(averages.keys()):
+        type_dict = averages[comparison_group]
+
+        fig, ax = plt.subplots(figsize=(12, 6))
+
+        colors = {"within": "#1f77b4", "between": "#ff7f0e", "full": "#2ca02c"}
+
+        for comparison_type in sorted(type_dict.keys()):
+            means, sems = type_dict[comparison_type]
+            trs = np.arange(len(means))
+
+            color = colors.get(comparison_type, "#999999")
+
+            ax.plot(trs, means, label=comparison_type, color=color, linewidth=2)
+            ax.fill_between(
+                trs,
+                means - sems,
+                means + sems,
+                alpha=0.2,
+                color=color,
+            )
+
+        ax.set_xlabel("TR")
+        ax.set_ylabel("Correlation (LOSO) or Mean Fisher-z (Pairwise)")
+        ax.set_title(
+            f"Time-Resolved ISC: {comparison_group} group (ROI: {roi_label}, Approach: {approach})"
+        )
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+        fig_path = analysis_dir / f"roi-{roi_label}_group-{comparison_group}_approach-{approach}_figure.png"
+        fig.savefig(fig_path, dpi=100, bbox_inches="tight")
+        plt.close(fig)
+        figure_paths.append(fig_path)
+
+    return figure_paths
 
 
 def _series_to_wide_df(series_map: dict[str, np.ndarray]) -> pd.DataFrame:
@@ -296,6 +456,7 @@ def run_time_resolved_isc_analysis(
         roi_name=config_dict.get("roi_name"),
         timecourse_glob=config_dict.get("timecourse_glob"),
         timecourse_files=config_dict.get("timecourse_files"),
+        make_figures=bool(config_dict.get("make_figures", True)),
     )
 
     if config.approach not in {"loso", "pairwise"}:
@@ -448,21 +609,66 @@ def run_time_resolved_isc_analysis(
         "n_timepoints": n_timepoints,
         "comparison_sets": sorted(comparison_sets.keys()),
         "files": {},
+        "subject_dirs": {},
     }
 
     if config.approach == "loso":
-        for set_name, set_series in loso_summary.items():
-            out_name = f"desc-{_safe_name(set_name)}_roi-{roi_label}_approach-loso_timeseries.tsv"
-            out_path = analysis_dir / out_name
-            _series_to_wide_df(set_series).to_csv(out_path, sep="\t", index=False, na_rep="")
-            outputs["files"][f"loso_{set_name}"] = str(out_path)
+        long_df = _results_to_long_format(
+            loso_summary, subjects, n_timepoints, groups, roi_label
+        )
+
+        for subject in subjects:
+            subject_dir = analysis_dir / subject
+            subject_dir.mkdir(parents=True, exist_ok=True)
+            subject_df = long_df[long_df["subject"] == subject].copy()
+            subject_path = subject_dir / f"{subject}_roi-{roi_label}_approach-loso_timeseries.tsv"
+            subject_df.drop(columns=["subject"]).to_csv(
+                subject_path, sep="\t", index=False, na_rep=""
+            )
+            outputs["subject_dirs"][subject] = str(subject_dir)
+
+        group_path = analysis_dir / f"roi-{roi_label}_approach-loso_timeseries.tsv"
+        long_df.to_csv(group_path, sep="\t", index=False, na_rep="")
+        outputs["files"]["loso_group_timeseries"] = str(group_path)
+
+        if config.make_figures:
+            logger.info("Computing group averages and generating figures for LOSO")
+            averages = _compute_group_averages(long_df)
+            avg_path = _save_group_averages_tsv(averages, analysis_dir, roi_label, "loso")
+            outputs["files"]["loso_group_averages"] = str(avg_path)
+
+            fig_paths = _create_group_figures(averages, analysis_dir, roi_label, "loso")
+            outputs["files"]["loso_figures"] = [str(p) for p in fig_paths]
+            logger.info("Generated %d LOSO figures", len(fig_paths))
 
     if config.approach == "pairwise":
-        for set_name, set_series in pairwise_summary.items():
-            out_name = f"desc-{_safe_name(set_name)}_roi-{roi_label}_approach-pairwise_timeseries.tsv"
-            out_path = analysis_dir / out_name
-            _series_to_wide_df(set_series).to_csv(out_path, sep="\t", index=False, na_rep="")
-            outputs["files"][f"pairwise_mean_{set_name}"] = str(out_path)
+        long_df = _results_to_long_format(
+            pairwise_summary, subjects, n_timepoints, groups, roi_label
+        )
+
+        for subject in subjects:
+            subject_dir = analysis_dir / subject
+            subject_dir.mkdir(parents=True, exist_ok=True)
+            subject_df = long_df[long_df["subject"] == subject].copy()
+            subject_path = subject_dir / f"{subject}_roi-{roi_label}_approach-pairwise_timeseries.tsv"
+            subject_df.drop(columns=["subject"]).to_csv(
+                subject_path, sep="\t", index=False, na_rep=""
+            )
+            outputs["subject_dirs"][subject] = str(subject_dir)
+
+        group_path = analysis_dir / f"roi-{roi_label}_approach-pairwise_timeseries.tsv"
+        long_df.to_csv(group_path, sep="\t", index=False, na_rep="")
+        outputs["files"]["pairwise_group_timeseries"] = str(group_path)
+
+        if config.make_figures:
+            logger.info("Computing group averages and generating figures for pairwise")
+            averages = _compute_group_averages(long_df)
+            avg_path = _save_group_averages_tsv(averages, analysis_dir, roi_label, "pairwise")
+            outputs["files"]["pairwise_group_averages"] = str(avg_path)
+
+            fig_paths = _create_group_figures(averages, analysis_dir, roi_label, "pairwise")
+            outputs["files"]["pairwise_figures"] = [str(p) for p in fig_paths]
+            logger.info("Generated %d pairwise figures", len(fig_paths))
 
         pairwise_path = analysis_dir / f"desc-pairwise_roi-{roi_label}_details.tsv"
         pairwise_df = pd.DataFrame(pairwise_rows)
