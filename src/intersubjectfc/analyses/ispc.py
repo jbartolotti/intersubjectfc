@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 import nibabel as nib
+from nilearn.image import resample_to_img
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -117,11 +118,49 @@ def _load_censor_mask(censor_file: Path, n_timepoints: int) -> np.ndarray:
 # Helpers: mask and data loading
 # ---------------------------------------------------------------------------
 
-def _load_roi_mask(mask_path: str | Path) -> np.ndarray:
-    """Load ROI mask, return flat boolean array of in-mask voxel indices."""
-    img = nib.load(str(mask_path))
-    data = np.asanyarray(img.dataobj)
-    return data.ravel().astype(bool)
+def _resolve_brain_load_path(brain_file: Path) -> Path:
+    """Return the loadable path for a brain image (prefer AFNI .HEAD over .BRIK)."""
+    brain_path = brain_file
+    if brain_path.suffix.upper() == ".BRIK":
+        head_path = brain_path.with_suffix(".HEAD")
+        if head_path.exists():
+            return head_path
+    return brain_path
+
+
+def _load_roi_mask_for_reference(mask_path: str | Path, reference_brain_file: Path) -> np.ndarray:
+    """Load ROI mask and align it to a reference brain grid.
+
+    If shape/affine differ, nearest-neighbor resampling is applied so that the
+    mask can be indexed against the flattened 4D brain data.
+    """
+    mask_img = nib.load(str(mask_path))
+    ref_img = nib.load(str(_resolve_brain_load_path(reference_brain_file)))
+
+    ref_3d = nib.Nifti1Image(
+        np.asanyarray(ref_img.dataobj)[..., 0],
+        ref_img.affine,
+        ref_img.header,
+    )
+
+    same_shape = tuple(mask_img.shape[:3]) == tuple(ref_3d.shape[:3])
+    same_affine = np.allclose(mask_img.affine, ref_3d.affine, atol=1e-3)
+
+    if not (same_shape and same_affine):
+        logger.info(
+            "Resampling ROI mask to reference brain grid: mask_shape=%s, ref_shape=%s",
+            mask_img.shape,
+            ref_3d.shape,
+        )
+        mask_img = resample_to_img(mask_img, ref_3d, interpolation="nearest", force_resample=True)
+
+    mask_data = np.asanyarray(mask_img.dataobj)
+    mask_bool = mask_data.ravel().astype(bool)
+    if not np.any(mask_bool):
+        raise ValueError(
+            f"ROI mask has zero in-mask voxels after alignment: {mask_path}"
+        )
+    return mask_bool
 
 
 def _load_4d_brain(
@@ -133,18 +172,18 @@ def _load_4d_brain(
     Returns array of shape (n_timepoints, n_voxels).
     Loads .HEAD/.BRIK via nibabel; also handles NIfTI.
     """
-    # For AFNI BRIK, nibabel expects the .HEAD file.
-    brik_path = brain_file
-    if brik_path.suffix.upper() == ".BRIK":
-        head_path = brik_path.with_suffix(".HEAD")
-        if head_path.exists():
-            brik_path = head_path
+    brik_path = _resolve_brain_load_path(brain_file)
 
     img = nib.load(str(brik_path))
     data = np.asanyarray(img.dataobj).astype(np.float32)   # (x, y, z, t)
 
     # Flatten to (n_voxels, n_timepoints) then transpose.
     flat = data.reshape(-1, data.shape[-1])                 # (n_voxels_total, t)
+    if flat.shape[0] != mask_flat.shape[0]:
+        raise ValueError(
+            "ROI mask and brain volume size mismatch after alignment: "
+            f"brain_voxels={flat.shape[0]}, mask_voxels={mask_flat.shape[0]}, file={brain_file}"
+        )
     masked = flat[mask_flat, :]                             # (n_mask_voxels, t)
     return masked.T                                         # (t, n_mask_voxels)
 
@@ -386,10 +425,11 @@ def _results_to_long_format(
 # Cache helpers
 # ---------------------------------------------------------------------------
 
-def _safe_name(s: str | None) -> str:
+def _safe_name(s: Any) -> str:
     if not s:
         return "unknown"
-    return s.replace(" ", "_").replace("/", "-").replace("\\", "-")
+    s_str = str(s)
+    return s_str.replace(" ", "_").replace("/", "-").replace("\\", "-")
 
 
 def _load_cached_subject_summary(
@@ -431,9 +471,13 @@ def run_ispc_analysis(
 ) -> dict[str, Any]:
     """Run Inter-Subject Pattern Correlation (ISPC) for a single ROI mask."""
 
+    roi_name = config_dict.get("roi_name")
+    if roi_name is None:
+        roi_name = _safe_name(config_dict.get("roi_mask", "roi"))
+
     config = ISPCConfig(
         roi_mask=config_dict["roi_mask"],
-        roi_name=config_dict.get("roi_name", _safe_name(config_dict.get("roi_mask", "roi"))),
+        roi_name=str(roi_name),
         approach=str(config_dict.get("approach", "loso")).lower(),
         brain_data_root=config_dict.get("brain_data_root"),
         brain_glob=config_dict.get("brain_glob"),
@@ -500,9 +544,9 @@ def run_ispc_analysis(
             "subject_dirs": {s: str(analysis_dir / s) for s in subjects},
         }
 
-    # Load ROI mask.
+    # Load ROI mask aligned to the first subject's brain grid.
     logger.info("Loading ROI mask: %s", config.roi_mask)
-    mask_flat = _load_roi_mask(config.roi_mask)
+    mask_flat = _load_roi_mask_for_reference(config.roi_mask, subject_to_file[subjects[0]])
     logger.info("Mask contains %d voxels", int(np.sum(mask_flat)))
 
     # Load 4D data for all subjects.
