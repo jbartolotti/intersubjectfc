@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .analyses import run_time_resolved_isc_analysis
+
 
 def _ensure_derivative_layout(bids_root: Path, derivative_name: str) -> Path:
     """Create and return the derivatives path for this package."""
@@ -87,7 +89,29 @@ def run_intersubject_fc(
     output_root = _ensure_derivative_layout(bids_root=bids_root, derivative_name=derivative_name)
     description_path = _write_dataset_description(output_root=output_root)
 
-    # Placeholder output to establish derivative write conventions.
+    analysis_outputs: list[dict[str, Any]] = []
+    analyses = (config or {}).get("analyses", [])
+    for analysis in analyses:
+        name = analysis.get("name")
+        analysis_config = analysis.get("config", {})
+
+        if name == "time_resolved_isc":
+            result = run_time_resolved_isc_analysis(
+                bids_root=bids_root,
+                output_root=output_root,
+                discovered_inputs=discovered_inputs,
+                config_dict=analysis_config,
+            )
+            analysis_outputs.append(result)
+        else:
+            analysis_outputs.append(
+                {
+                    "analysis": name,
+                    "status": "skipped",
+                    "reason": "Analysis is not yet implemented.",
+                }
+            )
+
     run_info = {
         "package": "intersubjectfc",
         "status": "initialized",
@@ -97,6 +121,7 @@ def run_intersubject_fc(
         "derivative_root": str(output_root),
         "dataset_description": str(description_path),
         "config": config or {},
+        "analysis_outputs": analysis_outputs,
     }
 
     (output_root / "run_info.json").write_text(json.dumps(run_info, indent=2), encoding="utf-8")
