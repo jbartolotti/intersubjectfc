@@ -458,6 +458,37 @@ def _series_to_wide_df(series_map: dict[str, np.ndarray]) -> pd.DataFrame:
     return pd.DataFrame(data)
 
 
+def _load_cached_subject_summary(
+    subject_path: Path,
+    comparison_sets: list[str],
+    n_timepoints: int,
+) -> dict[str, np.ndarray] | None:
+    """Load a cached subject long-format TSV into set_name -> per-TR summary arrays."""
+    if not subject_path.exists():
+        return None
+
+    df = pd.read_csv(subject_path, sep="\t")
+    required_cols = {"comparison_group", "tr", "value"}
+    if not required_cols.issubset(df.columns):
+        return None
+
+    out: dict[str, np.ndarray] = {
+        set_name: np.full(n_timepoints, np.nan, dtype=float) for set_name in comparison_sets
+    }
+
+    for set_name in comparison_sets:
+        subset = df[df["comparison_group"] == set_name]
+        if subset.empty:
+            continue
+
+        trs = subset["tr"].to_numpy(dtype=int)
+        vals = subset["value"].to_numpy(dtype=float)
+        valid = (trs >= 0) & (trs < n_timepoints) & np.isfinite(vals)
+        out[set_name][trs[valid]] = vals[valid]
+
+    return out
+
+
 def run_time_resolved_isc_analysis(
     bids_root: Path,
     output_root: Path,
@@ -490,22 +521,62 @@ def run_time_resolved_isc_analysis(
     group_dir.mkdir(parents=True, exist_ok=True)
 
     # Default behavior: reuse cache unless overwrite is explicitly enabled.
+    # A cache hit requires metadata, group outputs, and all per-subject outputs.
+    subject_to_file = _find_timecourse_files(bids_root=bids_root, config=config)
+    subjects = sorted(subject_to_file)
+
     metadata_path = group_dir / f"roi-{roi_label}_approach-{config.approach}_timeseries_metadata.json"
-    if not overwrite and metadata_path.exists():
-        logger.info("Cache hit: skipping analysis for roi=%s, approach=%s", config.roi_name, config.approach)
-        return {
+    group_timeseries_path = group_dir / f"roi-{roi_label}_approach-{config.approach}_timeseries.tsv"
+    group_averages_path = group_dir / f"roi-{roi_label}_approach-{config.approach}_group_averages.tsv"
+    subject_timeseries_paths = [
+        analysis_dir / subject / f"{subject}_roi-{roi_label}_approach-{config.approach}_timeseries.tsv"
+        for subject in subjects
+    ]
+
+    required_cache_paths: list[Path] = [metadata_path, group_timeseries_path, *subject_timeseries_paths]
+    if config.make_figures:
+        required_cache_paths.append(group_averages_path)
+
+    missing_cache_paths = [path for path in required_cache_paths if not path.exists()]
+    if not overwrite and not missing_cache_paths:
+        outputs: dict[str, Any] = {
             "analysis": "time_resolved_isc",
             "status": "skipped_cache",
             "roi_name": config.roi_name,
             "roi_label": roi_label,
             "approach": config.approach,
+            "window_size_trs": config.window_size_trs,
+            "n_subjects": len(subjects),
             "group_dir": str(group_dir),
-            "files": {"metadata": str(metadata_path)},
+            "files": {
+                f"{config.approach}_group_timeseries": str(group_timeseries_path),
+                "metadata": str(metadata_path),
+            },
+            "subject_dirs": {subject: str(analysis_dir / subject) for subject in subjects},
             "message": f"Using cached outputs from {analysis_dir}",
         }
 
+        if group_averages_path.exists():
+            outputs["files"][f"{config.approach}_group_averages"] = str(group_averages_path)
+
+        if config.approach == "pairwise":
+            pairwise_details_path = group_dir / f"desc-pairwise_roi-{roi_label}_details.tsv"
+            if pairwise_details_path.exists():
+                outputs["files"]["pairwise_details"] = str(pairwise_details_path)
+
+        figure_paths = sorted(group_dir.glob(f"roi-{roi_label}_group-*_approach-{config.approach}_figure.png"))
+        if figure_paths:
+            outputs["files"][f"{config.approach}_figures"] = [str(path) for path in figure_paths]
+
+        logger.info(
+            "Cache hit: skipping computation for roi=%s, approach=%s (%d subjects)",
+            config.roi_name,
+            config.approach,
+            len(subjects),
+        )
+        return outputs
+
     required_samples = _required_samples(config.min_samples, config.window_size_trs)
-    subject_to_file = _find_timecourse_files(bids_root=bids_root, config=config)
     logger.info(
         "time_resolved_isc starting with approach=%s, window_size_trs=%d, required_samples=%d",
         config.approach,
@@ -513,7 +584,6 @@ def run_time_resolved_isc_analysis(
         required_samples,
     )
 
-    subjects = sorted(subject_to_file)
     logger.info("Found %d participant timeseries files", len(subjects))
     subject_series: dict[str, np.ndarray] = {}
     subject_valid_mask: dict[str, np.ndarray] = {}
@@ -571,7 +641,47 @@ def run_time_resolved_isc_analysis(
     }
     pairwise_rows: list[dict[str, Any]] = []
 
+    cached_subjects: set[str] = set()
+    if not overwrite:
+        for subject in subjects:
+            subject_cache_path = analysis_dir / subject / (
+                f"{subject}_roi-{roi_label}_approach-{config.approach}_timeseries.tsv"
+            )
+            cached_map = _load_cached_subject_summary(
+                subject_cache_path,
+                list(comparison_sets.keys()),
+                n_timepoints,
+            )
+            if cached_map is None:
+                continue
+
+            if config.approach == "loso":
+                for set_name in comparison_sets:
+                    loso_summary[set_name][subject] = cached_map[set_name]
+            else:
+                for set_name in comparison_sets:
+                    pairwise_summary[set_name][subject] = cached_map[set_name]
+
+            cached_subjects.add(subject)
+
+    if cached_subjects:
+        logger.info(
+            "Loaded cached %s summaries for %d/%d participants",
+            config.approach,
+            len(cached_subjects),
+            len(subjects),
+        )
+
     for subject_index, subject in enumerate(subjects, start=1):
+        if subject in cached_subjects:
+            logger.info(
+                "Using cached ISC for participant %d/%d: %s",
+                subject_index,
+                len(subjects),
+                subject,
+            )
+            continue
+
         logger.info("Computing ISC for participant %d/%d: %s", subject_index, len(subjects), subject)
         for tr in range(n_timepoints):
             start, end = _window_bounds(center_tr=tr, window_size_trs=config.window_size_trs)
