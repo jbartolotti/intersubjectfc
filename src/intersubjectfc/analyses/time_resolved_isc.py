@@ -32,6 +32,7 @@ class TimeResolvedISCConfig:
     timecourse_files: dict[str, str] | None = None
     make_figures: bool = True
     overwrite_figures: bool = False
+    activation_shared_zero: bool = False
     event_seconds: list[float] | None = None
     tr_seconds: float | None = None
 
@@ -391,6 +392,215 @@ def _save_group_averages_tsv(
     return out_path
 
 
+def _load_group_averages_tsv(
+    path: Path,
+) -> dict[str, dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]]:
+    """Reconstruct the nested averages dict from a saved group_averages TSV."""
+    df = pd.read_csv(path, sep="\t")
+    averages: dict[str, dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]] = {}
+
+    for comparison_group, cg_df in df.groupby("comparison_group"):
+        averages[str(comparison_group)] = {}
+        for comparison_type, ct_df in cg_df.groupby("comparison_type"):
+            ct_df = ct_df.sort_values("tr")
+            n_trs = int(ct_df["tr"].max()) + 1
+            means = np.full(n_trs, np.nan)
+            sems = np.full(n_trs, np.nan)
+            counts = np.zeros(n_trs)
+            for _, row in ct_df.iterrows():
+                tr_idx = int(row["tr"])
+                means[tr_idx] = row["mean"]
+                sems[tr_idx] = row["sem"]
+                counts[tr_idx] = row["n"]
+            averages[str(comparison_group)][str(comparison_type)] = (means, sems, counts)
+
+    return averages
+
+
+def _compute_group_activation_averages(
+    subject_series: dict[str, np.ndarray],
+    subject_valid_mask: dict[str, np.ndarray],
+    comparison_sets: dict[str, list[str]],
+    n_timepoints: int,
+) -> dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """Compute per-TR activation averages for each comparison group."""
+    out: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+
+    for set_name, set_subjects in comparison_sets.items():
+        if not set_subjects:
+            continue
+        comparison_group = "all" if set_name == "full" else set_name
+        matrix = np.vstack([subject_series[s] for s in set_subjects]).astype(float)
+        valid = np.vstack([subject_valid_mask[s] for s in set_subjects])
+        matrix = np.where(valid, matrix, np.nan)
+
+        means = np.full(n_timepoints, np.nan)
+        sems = np.full(n_timepoints, np.nan)
+        counts = np.zeros(n_timepoints)
+
+        for tr_idx in range(n_timepoints):
+            vals = matrix[:, tr_idx]
+            finite = np.isfinite(vals)
+            n = int(np.sum(finite))
+            counts[tr_idx] = n
+            if n > 0:
+                means[tr_idx] = float(np.mean(vals[finite]))
+            if n >= 2:
+                sems[tr_idx] = float(np.std(vals[finite], ddof=1) / np.sqrt(n))
+
+        out[comparison_group] = (means, sems, counts)
+
+    return out
+
+
+def _save_group_activation_averages_tsv(
+    activation_averages: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]],
+    analysis_dir: Path,
+    roi_label: str,
+    approach: str,
+) -> Path:
+    rows: list[dict[str, Any]] = []
+    for comparison_group, (means, sems, counts) in sorted(activation_averages.items()):
+        for tr_idx, (m, s, n) in enumerate(zip(means, sems, counts)):
+            if np.isnan(m):
+                continue
+            rows.append(
+                {
+                    "comparison_group": comparison_group,
+                    "tr": tr_idx,
+                    "activation_mean": float(m),
+                    "activation_sem": float(s) if not np.isnan(s) else "",
+                    "n": int(n),
+                }
+            )
+
+    out_path = analysis_dir / f"roi-{roi_label}_approach-{approach}_activation_averages.tsv"
+    pd.DataFrame(rows).to_csv(out_path, sep="\t", index=False, na_rep="")
+    return out_path
+
+
+def _load_group_activation_averages_tsv(
+    path: Path,
+) -> dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    df = pd.read_csv(path, sep="\t")
+    out: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+
+    for comparison_group, group_df in df.groupby("comparison_group"):
+        group_df = group_df.sort_values("tr")
+        n_trs = int(group_df["tr"].max()) + 1
+        means = np.full(n_trs, np.nan)
+        sems = np.full(n_trs, np.nan)
+        counts = np.zeros(n_trs)
+        for _, row in group_df.iterrows():
+            tr_idx = int(row["tr"])
+            means[tr_idx] = row["activation_mean"]
+            sems[tr_idx] = row["activation_sem"]
+            counts[tr_idx] = row["n"]
+        out[str(comparison_group)] = (means, sems, counts)
+
+    return out
+
+
+def _align_twin_zero(ax: Any, ax2: Any) -> None:
+    """Shift ax2 limits so y=0 falls at the same relative height as in ax."""
+    lo1, hi1 = ax.get_ylim()
+    lo2, hi2 = ax2.get_ylim()
+    span1, span2 = hi1 - lo1, hi2 - lo2
+    if span1 == 0 or span2 == 0:
+        return
+    f = max(0.0, min(1.0, (0.0 - lo1) / span1))
+    candidates: list[float] = [span2]
+    if f > 0 and lo2 < 0:
+        candidates.append(-lo2 / f)
+    if f < 1 and hi2 > 0:
+        candidates.append(hi2 / (1.0 - f))
+    new_span = max(candidates)
+    ax2.set_ylim(-f * new_span, (1.0 - f) * new_span)
+
+
+def _create_group_figures_with_activation(
+    averages: dict[str, dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]],
+    activation_averages: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]],
+    analysis_dir: Path,
+    roi_label: str,
+    approach: str,
+    event_seconds: list[float] | None = None,
+    tr_seconds: float | None = None,
+    shared_zero: bool = False,
+) -> list[Path]:
+    figure_paths: list[Path] = []
+
+    n_trs_all = max(
+        (len(means) for type_dict in averages.values() for means, _, _ in type_dict.values()),
+        default=0,
+    )
+    fig_width = max(12.0, n_trs_all * 0.075)
+
+    colors = {"within": "#1f77b4", "between": "#ff7f0e", "full": "#2ca02c"}
+
+    for comparison_group in sorted(averages.keys()):
+        type_dict = averages[comparison_group]
+        fig, ax = plt.subplots(figsize=(fig_width, 6))
+        ax2 = ax.twinx()
+
+        for comparison_type in sorted(type_dict.keys()):
+            means, sems, _counts = type_dict[comparison_type]
+            trs = np.arange(len(means))
+            color = colors.get(comparison_type, "#999999")
+            ax.plot(trs, means, label=comparison_type, color=color, linewidth=2)
+            valid_sem = ~np.isnan(sems)
+            if np.any(valid_sem):
+                ax.fill_between(
+                    trs,
+                    np.where(valid_sem, means - sems, np.nan),
+                    np.where(valid_sem, means + sems, np.nan),
+                    alpha=0.2,
+                    color=color,
+                )
+
+        activation_tuple = activation_averages.get(comparison_group)
+        if activation_tuple is not None:
+            activation_means, _activation_sems, _activation_counts = activation_tuple
+            trs = np.arange(len(activation_means))
+            ax2.plot(
+                trs,
+                activation_means,
+                label="activation",
+                color="#111111",
+                linewidth=1.25,
+                alpha=0.5,
+            )
+
+        if event_seconds is not None and tr_seconds is not None and tr_seconds > 0:
+            for event_sec in event_seconds:
+                ax.axvline(event_sec / tr_seconds, color="gray", linestyle="--", alpha=0.3, linewidth=1)
+                ax.axvline((event_sec + 6.0) / tr_seconds, color="gray", linestyle="--", alpha=0.6, linewidth=1)
+
+        if shared_zero:
+            _align_twin_zero(ax, ax2)
+
+        ax.set_xlabel("TR")
+        ax.set_ylabel("Correlation (LOSO) or Mean Fisher-z (Pairwise)")
+        ax2.set_ylabel("Activation")
+        ax.set_title(
+            f"Time-Resolved ISC + Activation: {comparison_group} group "
+            f"(ROI: {roi_label}, Approach: {approach})"
+        )
+        lines1, labels1 = ax.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax.legend(lines1 + lines2, labels1 + labels2)
+        ax.grid(True, alpha=0.3)
+
+        fig_path = analysis_dir / (
+            f"roi-{roi_label}_group-{comparison_group}_approach-{approach}_figure_with_activation.png"
+        )
+        fig.savefig(fig_path, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        figure_paths.append(fig_path)
+
+    return figure_paths
+
+
 def _create_group_figures(
     averages: dict[str, dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]],
     analysis_dir: Path,
@@ -398,19 +608,31 @@ def _create_group_figures(
     approach: str,
     event_seconds: list[float] | None = None,
     tr_seconds: float | None = None,
+    shared_zero: bool = False,
 ) -> list[Path]:
     """Create PNG figures for each comparison_group showing all comparison_types.
     
     Optionally overlays event markers (faint) and hemodynamic lag markers (darker).
     
     Returns list of created figure paths.
+
+    Notes:
+        shared_zero is accepted for cross-task API consistency. This plot currently
+        uses a single y-axis, so the option is a no-op here.
     """
     figure_paths: list[Path] = []
+
+    # Scale figure width with dataset length: ~0.075 in/TR, minimum 12 in.
+    n_trs_all = max(
+        (len(means) for type_dict in averages.values() for means, _, _ in type_dict.values()),
+        default=0,
+    )
+    fig_width = max(12.0, n_trs_all * 0.075)
 
     for comparison_group in sorted(averages.keys()):
         type_dict = averages[comparison_group]
 
-        fig, ax = plt.subplots(figsize=(12, 6))
+        fig, ax = plt.subplots(figsize=(fig_width, 6))
 
         colors = {"within": "#1f77b4", "between": "#ff7f0e", "full": "#2ca02c"}
 
@@ -519,6 +741,7 @@ def run_time_resolved_isc_analysis(
         timecourse_files=config_dict.get("timecourse_files"),
         make_figures=bool(config_dict.get("make_figures", True)),
         overwrite_figures=bool(config_dict.get("overwrite_figures", False)),
+        activation_shared_zero=bool(config_dict.get("activation_shared_zero", False)),
         event_seconds=config_dict.get("event_seconds"),
         tr_seconds=config_dict.get("tr_seconds"),
     )
@@ -540,6 +763,7 @@ def run_time_resolved_isc_analysis(
     metadata_path = group_dir / f"roi-{roi_label}_approach-{config.approach}_timeseries_metadata.json"
     group_timeseries_path = group_dir / f"roi-{roi_label}_approach-{config.approach}_timeseries.tsv"
     group_averages_path = group_dir / f"roi-{roi_label}_approach-{config.approach}_group_averages.tsv"
+    activation_averages_path = group_dir / f"roi-{roi_label}_approach-{config.approach}_activation_averages.tsv"
     subject_timeseries_paths = [
         analysis_dir / subject / f"{subject}_roi-{roi_label}_approach-{config.approach}_timeseries.tsv"
         for subject in subjects
@@ -584,28 +808,74 @@ def run_time_resolved_isc_analysis(
         # Figures (and future: inferential stats) — handled independently of computation cache
         if config.make_figures and group_averages_path.exists():
             existing_figs = sorted(group_dir.glob(f"roi-{roi_label}_group-*_approach-{config.approach}_figure.png"))
-            if config.overwrite_figures or not existing_figs:
+            existing_overlay_figs = sorted(
+                group_dir.glob(f"roi-{roi_label}_group-*_approach-{config.approach}_figure_with_activation.png")
+            )
+
+            needs_base = config.overwrite_figures or not existing_figs
+            needs_overlay = config.overwrite_figures or not existing_overlay_figs
+            if needs_base or needs_overlay:
                 logger.info("Generating figures from cached averages for roi=%s", config.roi_name)
-                averages_df = pd.read_csv(group_averages_path, sep="\t")
-                fig_paths = _create_group_figures(
-                    averages_df,
-                    group_dir,
-                    roi_label,
-                    config.approach,
-                    event_seconds=config.event_seconds,
-                    tr_seconds=config.tr_seconds,
-                )
+                averages = _load_group_averages_tsv(group_averages_path)
+
+                if needs_base:
+                    fig_paths = _create_group_figures(
+                        averages,
+                        group_dir,
+                        roi_label,
+                        config.approach,
+                        event_seconds=config.event_seconds,
+                        tr_seconds=config.tr_seconds,
+                        shared_zero=config.activation_shared_zero,
+                    )
+                else:
+                    fig_paths = existing_figs
+
+                if activation_averages_path.exists() and needs_overlay:
+                    activation_averages = _load_group_activation_averages_tsv(activation_averages_path)
+                    overlay_fig_paths = _create_group_figures_with_activation(
+                        averages,
+                        activation_averages,
+                        group_dir,
+                        roi_label,
+                        config.approach,
+                        event_seconds=config.event_seconds,
+                        tr_seconds=config.tr_seconds,
+                        shared_zero=config.activation_shared_zero,
+                    )
+                else:
+                    overlay_fig_paths = existing_overlay_figs
+
                 cached_outputs["status"] = "refreshed_figures"
-                logger.info("Generated %d figures for roi=%s", len(fig_paths), config.roi_name)
+                logger.info(
+                    "Generated %d base figures and %d activation-overlay figures for roi=%s",
+                    len(fig_paths),
+                    len(overlay_fig_paths),
+                    config.roi_name,
+                )
             else:
                 fig_paths = existing_figs
+                overlay_fig_paths = existing_overlay_figs
+
             cached_outputs["files"][f"{config.approach}_group_averages"] = str(group_averages_path)
+            if activation_averages_path.exists():
+                cached_outputs["files"][f"{config.approach}_activation_averages"] = str(activation_averages_path)
             cached_outputs["files"][f"{config.approach}_figures"] = [str(p) for p in fig_paths]
+            cached_outputs["files"][f"{config.approach}_figures_with_activation"] = [str(p) for p in overlay_fig_paths]
         elif group_averages_path.exists():
             cached_outputs["files"][f"{config.approach}_group_averages"] = str(group_averages_path)
+            if activation_averages_path.exists():
+                cached_outputs["files"][f"{config.approach}_activation_averages"] = str(activation_averages_path)
             existing_figs = sorted(group_dir.glob(f"roi-{roi_label}_group-*_approach-{config.approach}_figure.png"))
+            existing_overlay_figs = sorted(
+                group_dir.glob(f"roi-{roi_label}_group-*_approach-{config.approach}_figure_with_activation.png")
+            )
             if existing_figs:
                 cached_outputs["files"][f"{config.approach}_figures"] = [str(p) for p in existing_figs]
+            if existing_overlay_figs:
+                cached_outputs["files"][f"{config.approach}_figures_with_activation"] = [
+                    str(p) for p in existing_overlay_figs
+                ]
 
         return cached_outputs
 
@@ -840,6 +1110,20 @@ def run_time_resolved_isc_analysis(
             avg_path = _save_group_averages_tsv(averages, group_dir, roi_label, "loso")
             outputs["files"]["loso_group_averages"] = str(avg_path)
 
+            activation_averages = _compute_group_activation_averages(
+                subject_series,
+                subject_valid_mask,
+                comparison_sets,
+                n_timepoints,
+            )
+            activation_avg_path = _save_group_activation_averages_tsv(
+                activation_averages,
+                group_dir,
+                roi_label,
+                "loso",
+            )
+            outputs["files"]["loso_activation_averages"] = str(activation_avg_path)
+
             existing_loso_figs = sorted(group_dir.glob(f"roi-{roi_label}_group-*_approach-loso_figure.png"))
             if config.overwrite_figures or not existing_loso_figs:
                 fig_paths = _create_group_figures(
@@ -849,12 +1133,33 @@ def run_time_resolved_isc_analysis(
                     "loso",
                     event_seconds=config.event_seconds,
                     tr_seconds=config.tr_seconds,
+                    shared_zero=config.activation_shared_zero,
                 )
                 logger.info("Generated %d LOSO figures", len(fig_paths))
             else:
                 fig_paths = existing_loso_figs
                 logger.info("Using cached LOSO figures (%d)", len(fig_paths))
             outputs["files"]["loso_figures"] = [str(p) for p in fig_paths]
+
+            existing_loso_overlay_figs = sorted(
+                group_dir.glob(f"roi-{roi_label}_group-*_approach-loso_figure_with_activation.png")
+            )
+            if config.overwrite_figures or not existing_loso_overlay_figs:
+                overlay_fig_paths = _create_group_figures_with_activation(
+                    averages,
+                    activation_averages,
+                    group_dir,
+                    roi_label,
+                    "loso",
+                    event_seconds=config.event_seconds,
+                    tr_seconds=config.tr_seconds,
+                    shared_zero=config.activation_shared_zero,
+                )
+                logger.info("Generated %d LOSO activation-overlay figures", len(overlay_fig_paths))
+            else:
+                overlay_fig_paths = existing_loso_overlay_figs
+                logger.info("Using cached LOSO activation-overlay figures (%d)", len(overlay_fig_paths))
+            outputs["files"]["loso_figures_with_activation"] = [str(p) for p in overlay_fig_paths]
 
     if config.approach == "pairwise":
         long_df = _results_to_long_format(
@@ -871,6 +1176,20 @@ def run_time_resolved_isc_analysis(
             avg_path = _save_group_averages_tsv(averages, group_dir, roi_label, "pairwise")
             outputs["files"]["pairwise_group_averages"] = str(avg_path)
 
+            activation_averages = _compute_group_activation_averages(
+                subject_series,
+                subject_valid_mask,
+                comparison_sets,
+                n_timepoints,
+            )
+            activation_avg_path = _save_group_activation_averages_tsv(
+                activation_averages,
+                group_dir,
+                roi_label,
+                "pairwise",
+            )
+            outputs["files"]["pairwise_activation_averages"] = str(activation_avg_path)
+
             existing_pw_figs = sorted(group_dir.glob(f"roi-{roi_label}_group-*_approach-pairwise_figure.png"))
             if config.overwrite_figures or not existing_pw_figs:
                 fig_paths = _create_group_figures(
@@ -880,12 +1199,33 @@ def run_time_resolved_isc_analysis(
                     "pairwise",
                     event_seconds=config.event_seconds,
                     tr_seconds=config.tr_seconds,
+                    shared_zero=config.activation_shared_zero,
                 )
                 logger.info("Generated %d pairwise figures", len(fig_paths))
             else:
                 fig_paths = existing_pw_figs
                 logger.info("Using cached pairwise figures (%d)", len(fig_paths))
             outputs["files"]["pairwise_figures"] = [str(p) for p in fig_paths]
+
+            existing_pw_overlay_figs = sorted(
+                group_dir.glob(f"roi-{roi_label}_group-*_approach-pairwise_figure_with_activation.png")
+            )
+            if config.overwrite_figures or not existing_pw_overlay_figs:
+                overlay_fig_paths = _create_group_figures_with_activation(
+                    averages,
+                    activation_averages,
+                    group_dir,
+                    roi_label,
+                    "pairwise",
+                    event_seconds=config.event_seconds,
+                    tr_seconds=config.tr_seconds,
+                    shared_zero=config.activation_shared_zero,
+                )
+                logger.info("Generated %d pairwise activation-overlay figures", len(overlay_fig_paths))
+            else:
+                overlay_fig_paths = existing_pw_overlay_figs
+                logger.info("Using cached pairwise activation-overlay figures (%d)", len(overlay_fig_paths))
+            outputs["files"]["pairwise_figures_with_activation"] = [str(p) for p in overlay_fig_paths]
 
         pairwise_path = group_dir / f"desc-pairwise_roi-{roi_label}_details.tsv"
         pairwise_df = pd.DataFrame(pairwise_rows)
@@ -908,6 +1248,7 @@ def run_time_resolved_isc_analysis(
             "timecourse_glob": config.timecourse_glob,
             "timecourse_files": config.timecourse_files,
             "make_figures": config.make_figures,
+            "activation_shared_zero": config.activation_shared_zero,
             "event_seconds": config.event_seconds,
             "tr_seconds": config.tr_seconds,
         },

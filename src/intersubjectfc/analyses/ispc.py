@@ -48,6 +48,7 @@ class ISPCConfig:
     group_column: str | None = None        # participants.tsv column for group comparisons
     make_figures: bool = True
     overwrite_figures: bool = False
+    activation_shared_zero: bool = False
     event_seconds: list[float] | None = None
     tr_seconds: float | None = None
 
@@ -351,9 +352,15 @@ def _create_group_figures(
     figure_paths: list[Path] = []
     colors = {"within": "#1f77b4", "between": "#ff7f0e", "full": "#2ca02c"}
 
+    n_trs_all = max(
+        (len(means) for type_dict in averages.values() for means, _, _ in type_dict.values()),
+        default=0,
+    )
+    fig_width = max(12.0, n_trs_all * 0.075)
+
     for comparison_group in sorted(averages.keys()):
         type_dict = averages[comparison_group]
-        fig, ax = plt.subplots(figsize=(12, 6))
+        fig, ax = plt.subplots(figsize=(fig_width, 6))
 
         for comparison_type in sorted(type_dict.keys()):
             means, sems, _counts = type_dict[comparison_type]
@@ -458,6 +465,23 @@ def _save_group_activation_averages_tsv(
     pd.DataFrame(rows).to_csv(out_path, sep="\t", index=False, na_rep="")
 
 
+def _align_twin_zero(ax: Any, ax2: Any) -> None:
+    """Shift ax2 limits so y=0 falls at the same relative height as in ax."""
+    lo1, hi1 = ax.get_ylim()
+    lo2, hi2 = ax2.get_ylim()
+    span1, span2 = hi1 - lo1, hi2 - lo2
+    if span1 == 0 or span2 == 0:
+        return
+    f = max(0.0, min(1.0, (0.0 - lo1) / span1))
+    candidates: list[float] = [span2]
+    if f > 0 and lo2 < 0:
+        candidates.append(-lo2 / f)
+    if f < 1 and hi2 > 0:
+        candidates.append(hi2 / (1.0 - f))
+    new_span = max(candidates)
+    ax2.set_ylim(-f * new_span, (1.0 - f) * new_span)
+
+
 def _create_group_figures_with_activation(
     averages: dict[str, dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]],
     activation_averages: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]],
@@ -466,13 +490,20 @@ def _create_group_figures_with_activation(
     approach: str,
     event_seconds: list[float] | None = None,
     tr_seconds: float | None = None,
+    shared_zero: bool = False,
 ) -> list[Path]:
     figure_paths: list[Path] = []
     colors = {"within": "#1f77b4", "between": "#ff7f0e", "full": "#2ca02c"}
 
+    n_trs_all = max(
+        (len(means) for type_dict in averages.values() for means, _, _ in type_dict.values()),
+        default=0,
+    )
+    fig_width = max(12.0, n_trs_all * 0.075)
+
     for comparison_group in sorted(averages.keys()):
         type_dict = averages[comparison_group]
-        fig, ax = plt.subplots(figsize=(12, 6))
+        fig, ax = plt.subplots(figsize=(fig_width, 6))
         ax2 = ax.twinx()
 
         for comparison_type in sorted(type_dict.keys()):
@@ -507,6 +538,9 @@ def _create_group_figures_with_activation(
             for event_sec in event_seconds:
                 ax.axvline(event_sec / tr_seconds, color="gray", linestyle="--", alpha=0.3, linewidth=1)
                 ax.axvline((event_sec + 6.0) / tr_seconds, color="gray", linestyle="--", alpha=0.6, linewidth=1)
+
+        if shared_zero:
+            _align_twin_zero(ax, ax2)
 
         ax.set_xlabel("TR")
         ax.set_ylabel("Pattern Correlation (ISPC)")
@@ -624,6 +658,7 @@ def run_ispc_analysis(
         group_column=config_dict.get("group_column"),
         make_figures=bool(config_dict.get("make_figures", True)),
         overwrite_figures=bool(config_dict.get("overwrite_figures", False)),
+        activation_shared_zero=bool(config_dict.get("activation_shared_zero", False)),
         event_seconds=config_dict.get("event_seconds"),
         tr_seconds=config_dict.get("tr_seconds"),
     )
@@ -1017,6 +1052,7 @@ def run_ispc_analysis(
                 config.approach,
                 event_seconds=config.event_seconds,
                 tr_seconds=config.tr_seconds,
+                shared_zero=config.activation_shared_zero,
             )
             outputs["files"]["figures"] = [str(p) for p in sorted(fig_paths + fig_paths_with_activation)]
             logger.info(
