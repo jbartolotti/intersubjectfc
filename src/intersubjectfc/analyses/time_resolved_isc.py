@@ -398,6 +398,7 @@ def _load_group_averages_tsv(
     """Reconstruct the nested averages dict from a saved group_averages TSV."""
     df = pd.read_csv(path, sep="\t")
     averages: dict[str, dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]] = {}
+    count_col = "n" if "n" in df.columns else ("count" if "count" in df.columns else None)
 
     for comparison_group, cg_df in df.groupby("comparison_group"):
         averages[str(comparison_group)] = {}
@@ -411,7 +412,8 @@ def _load_group_averages_tsv(
                 tr_idx = int(row["tr"])
                 means[tr_idx] = row["mean"]
                 sems[tr_idx] = row["sem"]
-                counts[tr_idx] = row["n"]
+                if count_col is not None:
+                    counts[tr_idx] = row[count_col]
             averages[str(comparison_group)][str(comparison_type)] = (means, sems, counts)
 
     return averages
@@ -484,6 +486,7 @@ def _load_group_activation_averages_tsv(
 ) -> dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]:
     df = pd.read_csv(path, sep="\t")
     out: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    count_col = "n" if "n" in df.columns else ("count" if "count" in df.columns else None)
 
     for comparison_group, group_df in df.groupby("comparison_group"):
         group_df = group_df.sort_values("tr")
@@ -495,7 +498,8 @@ def _load_group_activation_averages_tsv(
             tr_idx = int(row["tr"])
             means[tr_idx] = row["activation_mean"]
             sems[tr_idx] = row["activation_sem"]
-            counts[tr_idx] = row["n"]
+            if count_col is not None:
+                counts[tr_idx] = row[count_col]
         out[str(comparison_group)] = (means, sems, counts)
 
     return out
