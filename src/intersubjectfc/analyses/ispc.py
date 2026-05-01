@@ -499,8 +499,8 @@ def _create_group_figures_with_activation(
                 activation_means,
                 label="activation",
                 color="#111111",
-                linewidth=2,
-                alpha=0.9,
+                linewidth=1.25,
+                alpha=0.5,
             )
 
         if event_seconds is not None and tr_seconds is not None and tr_seconds > 0:
