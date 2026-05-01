@@ -31,6 +31,7 @@ class TimeResolvedISCConfig:
     timecourse_glob: str | None = None
     timecourse_files: dict[str, str] | None = None
     make_figures: bool = True
+    overwrite_figures: bool = False
     event_seconds: list[float] | None = None
     tr_seconds: float | None = None
 
@@ -517,6 +518,7 @@ def run_time_resolved_isc_analysis(
         timecourse_glob=config_dict.get("timecourse_glob"),
         timecourse_files=config_dict.get("timecourse_files"),
         make_figures=bool(config_dict.get("make_figures", True)),
+        overwrite_figures=bool(config_dict.get("overwrite_figures", False)),
         event_seconds=config_dict.get("event_seconds"),
         tr_seconds=config_dict.get("tr_seconds"),
     )
@@ -544,11 +546,12 @@ def run_time_resolved_isc_analysis(
     ]
 
     required_cache_paths: list[Path] = [metadata_path, group_timeseries_path, *subject_timeseries_paths]
-    if config.make_figures:
-        required_cache_paths.append(group_averages_path)
+
+    existing_figures = sorted(group_dir.glob(f"roi-{roi_label}_group-*_approach-{config.approach}_figure.png"))
+    figures_ready = (not config.make_figures) or (group_averages_path.exists() and len(existing_figures) > 0)
 
     missing_cache_paths = [path for path in required_cache_paths if not path.exists()]
-    if not overwrite and not missing_cache_paths:
+    if not overwrite and not missing_cache_paths and (not config.overwrite_figures or figures_ready):
         outputs: dict[str, Any] = {
             "analysis": "time_resolved_isc",
             "status": "skipped_cache",
@@ -585,6 +588,43 @@ def run_time_resolved_isc_analysis(
             len(subjects),
         )
         return outputs
+
+    # Figures-only refresh: all core cache exists, but overwrite_figures=True and figures need regenerating
+    if not overwrite and not missing_cache_paths and config.make_figures and config.overwrite_figures:
+        logger.info(
+            "Figures-only refresh for roi=%s, approach=%s",
+            config.roi_name,
+            config.approach,
+        )
+        averages_df = pd.read_csv(group_averages_path, sep="\t")
+        fig_paths = _create_group_figures(
+            averages_df,
+            group_dir,
+            roi_label,
+            config.approach,
+            event_seconds=config.event_seconds,
+            tr_seconds=config.tr_seconds,
+        )
+        outputs_refresh: dict[str, Any] = {
+            "analysis": "time_resolved_isc",
+            "status": "refreshed_figures",
+            "roi_name": config.roi_name,
+            "roi_label": roi_label,
+            "approach": config.approach,
+            "window_size_trs": config.window_size_trs,
+            "n_subjects": len(subjects),
+            "group_dir": str(group_dir),
+            "files": {
+                f"{config.approach}_group_timeseries": str(group_timeseries_path),
+                f"{config.approach}_group_averages": str(group_averages_path),
+                "metadata": str(metadata_path),
+                f"{config.approach}_figures": [str(p) for p in fig_paths],
+            },
+            "subject_dirs": {subject: str(analysis_dir / subject) for subject in subjects},
+            "message": f"Refreshed figures; using cached timeseries from {analysis_dir}",
+        }
+        logger.info("Refreshed %d figures for roi=%s", len(fig_paths), config.roi_name)
+        return outputs_refresh
 
     required_samples = _required_samples(config.min_samples, config.window_size_trs)
     logger.info(
@@ -816,16 +856,21 @@ def run_time_resolved_isc_analysis(
             avg_path = _save_group_averages_tsv(averages, group_dir, roi_label, "loso")
             outputs["files"]["loso_group_averages"] = str(avg_path)
 
-            fig_paths = _create_group_figures(
-                averages,
-                group_dir,
-                roi_label,
-                "loso",
-                event_seconds=config.event_seconds,
-                tr_seconds=config.tr_seconds,
-            )
+            existing_loso_figs = sorted(group_dir.glob(f"roi-{roi_label}_group-*_approach-loso_figure.png"))
+            if config.overwrite_figures or not existing_loso_figs:
+                fig_paths = _create_group_figures(
+                    averages,
+                    group_dir,
+                    roi_label,
+                    "loso",
+                    event_seconds=config.event_seconds,
+                    tr_seconds=config.tr_seconds,
+                )
+                logger.info("Generated %d LOSO figures", len(fig_paths))
+            else:
+                fig_paths = existing_loso_figs
+                logger.info("Using cached LOSO figures (%d)", len(fig_paths))
             outputs["files"]["loso_figures"] = [str(p) for p in fig_paths]
-            logger.info("Generated %d LOSO figures", len(fig_paths))
 
     if config.approach == "pairwise":
         long_df = _results_to_long_format(
@@ -842,16 +887,21 @@ def run_time_resolved_isc_analysis(
             avg_path = _save_group_averages_tsv(averages, group_dir, roi_label, "pairwise")
             outputs["files"]["pairwise_group_averages"] = str(avg_path)
 
-            fig_paths = _create_group_figures(
-                averages,
-                group_dir,
-                roi_label,
-                "pairwise",
-                event_seconds=config.event_seconds,
-                tr_seconds=config.tr_seconds,
-            )
+            existing_pw_figs = sorted(group_dir.glob(f"roi-{roi_label}_group-*_approach-pairwise_figure.png"))
+            if config.overwrite_figures or not existing_pw_figs:
+                fig_paths = _create_group_figures(
+                    averages,
+                    group_dir,
+                    roi_label,
+                    "pairwise",
+                    event_seconds=config.event_seconds,
+                    tr_seconds=config.tr_seconds,
+                )
+                logger.info("Generated %d pairwise figures", len(fig_paths))
+            else:
+                fig_paths = existing_pw_figs
+                logger.info("Using cached pairwise figures (%d)", len(fig_paths))
             outputs["files"]["pairwise_figures"] = [str(p) for p in fig_paths]
-            logger.info("Generated %d pairwise figures", len(fig_paths))
 
         pairwise_path = group_dir / f"desc-pairwise_roi-{roi_label}_details.tsv"
         pairwise_df = pd.DataFrame(pairwise_rows)
