@@ -545,14 +545,21 @@ def run_time_resolved_isc_analysis(
         for subject in subjects
     ]
 
-    required_cache_paths: list[Path] = [metadata_path, group_timeseries_path, *subject_timeseries_paths]
+    # ── Phase 1: decide whether the heavy ISC computation needs to run ──────────
+    core_cache_paths: list[Path] = [metadata_path, group_timeseries_path, *subject_timeseries_paths]
+    missing_core_paths = [p for p in core_cache_paths if not p.exists()]
+    needs_compute = overwrite or bool(missing_core_paths)
 
-    existing_figures = sorted(group_dir.glob(f"roi-{roi_label}_group-*_approach-{config.approach}_figure.png"))
-    figures_ready = (not config.make_figures) or (group_averages_path.exists() and len(existing_figures) > 0)
+    if not needs_compute:
+        # ── Phase 2 (cache hit): post-processing only ────────────────────────
+        logger.info(
+            "Cache hit: skipping ISC computation for roi=%s, approach=%s (%d subjects)",
+            config.roi_name,
+            config.approach,
+            len(subjects),
+        )
 
-    missing_cache_paths = [path for path in required_cache_paths if not path.exists()]
-    if not overwrite and not missing_cache_paths and (not config.overwrite_figures or figures_ready):
-        outputs: dict[str, Any] = {
+        cached_outputs: dict[str, Any] = {
             "analysis": "time_resolved_isc",
             "status": "skipped_cache",
             "roi_name": config.roi_name,
@@ -569,63 +576,40 @@ def run_time_resolved_isc_analysis(
             "message": f"Using cached outputs from {analysis_dir}",
         }
 
-        if group_averages_path.exists():
-            outputs["files"][f"{config.approach}_group_averages"] = str(group_averages_path)
-
         if config.approach == "pairwise":
             pairwise_details_path = group_dir / f"desc-pairwise_roi-{roi_label}_details.tsv"
             if pairwise_details_path.exists():
-                outputs["files"]["pairwise_details"] = str(pairwise_details_path)
+                cached_outputs["files"]["pairwise_details"] = str(pairwise_details_path)
 
-        figure_paths = sorted(group_dir.glob(f"roi-{roi_label}_group-*_approach-{config.approach}_figure.png"))
-        if figure_paths:
-            outputs["files"][f"{config.approach}_figures"] = [str(path) for path in figure_paths]
+        # Figures (and future: inferential stats) — handled independently of computation cache
+        if config.make_figures and group_averages_path.exists():
+            existing_figs = sorted(group_dir.glob(f"roi-{roi_label}_group-*_approach-{config.approach}_figure.png"))
+            if config.overwrite_figures or not existing_figs:
+                logger.info("Generating figures from cached averages for roi=%s", config.roi_name)
+                averages_df = pd.read_csv(group_averages_path, sep="\t")
+                fig_paths = _create_group_figures(
+                    averages_df,
+                    group_dir,
+                    roi_label,
+                    config.approach,
+                    event_seconds=config.event_seconds,
+                    tr_seconds=config.tr_seconds,
+                )
+                cached_outputs["status"] = "refreshed_figures"
+                logger.info("Generated %d figures for roi=%s", len(fig_paths), config.roi_name)
+            else:
+                fig_paths = existing_figs
+            cached_outputs["files"][f"{config.approach}_group_averages"] = str(group_averages_path)
+            cached_outputs["files"][f"{config.approach}_figures"] = [str(p) for p in fig_paths]
+        elif group_averages_path.exists():
+            cached_outputs["files"][f"{config.approach}_group_averages"] = str(group_averages_path)
+            existing_figs = sorted(group_dir.glob(f"roi-{roi_label}_group-*_approach-{config.approach}_figure.png"))
+            if existing_figs:
+                cached_outputs["files"][f"{config.approach}_figures"] = [str(p) for p in existing_figs]
 
-        logger.info(
-            "Cache hit: skipping computation for roi=%s, approach=%s (%d subjects)",
-            config.roi_name,
-            config.approach,
-            len(subjects),
-        )
-        return outputs
+        return cached_outputs
 
-    # Figures-only refresh: all core cache exists, but overwrite_figures=True and figures need regenerating
-    if not overwrite and not missing_cache_paths and config.make_figures and config.overwrite_figures:
-        logger.info(
-            "Figures-only refresh for roi=%s, approach=%s",
-            config.roi_name,
-            config.approach,
-        )
-        averages_df = pd.read_csv(group_averages_path, sep="\t")
-        fig_paths = _create_group_figures(
-            averages_df,
-            group_dir,
-            roi_label,
-            config.approach,
-            event_seconds=config.event_seconds,
-            tr_seconds=config.tr_seconds,
-        )
-        outputs_refresh: dict[str, Any] = {
-            "analysis": "time_resolved_isc",
-            "status": "refreshed_figures",
-            "roi_name": config.roi_name,
-            "roi_label": roi_label,
-            "approach": config.approach,
-            "window_size_trs": config.window_size_trs,
-            "n_subjects": len(subjects),
-            "group_dir": str(group_dir),
-            "files": {
-                f"{config.approach}_group_timeseries": str(group_timeseries_path),
-                f"{config.approach}_group_averages": str(group_averages_path),
-                "metadata": str(metadata_path),
-                f"{config.approach}_figures": [str(p) for p in fig_paths],
-            },
-            "subject_dirs": {subject: str(analysis_dir / subject) for subject in subjects},
-            "message": f"Refreshed figures; using cached timeseries from {analysis_dir}",
-        }
-        logger.info("Refreshed %d figures for roi=%s", len(fig_paths), config.roi_name)
-        return outputs_refresh
-
+    # ── Phase 1 continued: run the full ISC computation ──────────────────────
     required_samples = _required_samples(config.min_samples, config.window_size_trs)
     logger.info(
         "time_resolved_isc starting with approach=%s, window_size_trs=%d, required_samples=%d",
