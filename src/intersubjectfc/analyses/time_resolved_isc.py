@@ -631,7 +631,7 @@ def _create_group_figures(
         (len(means) for type_dict in averages.values() for means, _, _ in type_dict.values()),
         default=0,
     )
-    fig_width = max(12.0, n_trs_all * 0.075)
+    fig_width = max(12.0, n_trs_all * 0.025)
 
     for comparison_group in sorted(averages.keys()):
         type_dict = averages[comparison_group]
@@ -834,6 +834,66 @@ def run_time_resolved_isc_analysis(
                     )
                 else:
                     fig_paths = existing_figs
+
+                if needs_overlay and not activation_averages_path.exists():
+                    logger.info(
+                        "Activation averages cache missing; computing from subject timeseries for roi=%s",
+                        config.roi_name,
+                    )
+                    subject_series_for_activation: dict[str, np.ndarray] = {}
+                    subject_valid_mask_for_activation: dict[str, np.ndarray] = {}
+
+                    for subject in subjects:
+                        series = _read_timecourse_column(subject_to_file[subject], roi_name=config.roi_name)
+                        subject_series_for_activation[subject] = series
+
+                    series_lengths_activation = {
+                        subject: ts.shape[0] for subject, ts in subject_series_for_activation.items()
+                    }
+                    unique_lengths_activation = sorted(set(series_lengths_activation.values()))
+                    if len(unique_lengths_activation) != 1:
+                        raise ValueError(
+                            "All subject timecourses must have equal length for activation overlay. "
+                            f"Found lengths: {series_lengths_activation}"
+                        )
+
+                    n_timepoints_activation = unique_lengths_activation[0]
+                    for subject in subjects:
+                        series = subject_series_for_activation[subject]
+                        censor_file = _find_censor_file(subject_to_file[subject])
+                        if censor_file is not None:
+                            censor_values = _read_timecourse_column(censor_file)
+                            if censor_values.shape[0] != n_timepoints_activation:
+                                raise ValueError(
+                                    f"Censor length mismatch for {subject}: {censor_file} has "
+                                    f"{censor_values.shape[0]} rows, expected {n_timepoints_activation}."
+                                )
+                            censor_valid = _censor_to_valid_mask(censor_values)
+                        else:
+                            censor_valid = np.ones(n_timepoints_activation, dtype=bool)
+
+                        subject_valid_mask_for_activation[subject] = np.isfinite(series) & censor_valid
+
+                    participants_path_raw = discovered_inputs.get("participants_tsv_path")
+                    participants_path = Path(participants_path_raw) if participants_path_raw else None
+                    groups = _load_groups(
+                        participants_tsv_path=participants_path,
+                        group_column=config.group_column,
+                    )
+                    comparison_sets = _build_comparison_sets(subjects=subjects, groups=groups)
+
+                    activation_averages = _compute_group_activation_averages(
+                        subject_series_for_activation,
+                        subject_valid_mask_for_activation,
+                        comparison_sets,
+                        n_timepoints_activation,
+                    )
+                    _save_group_activation_averages_tsv(
+                        activation_averages,
+                        group_dir,
+                        roi_label,
+                        config.approach,
+                    )
 
                 if activation_averages_path.exists() and needs_overlay:
                     activation_averages = _load_group_activation_averages_tsv(activation_averages_path)
