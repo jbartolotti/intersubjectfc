@@ -47,6 +47,7 @@ class ISPCConfig:
     brain_files: dict[str, str] | None = None  # Explicit subject_id -> file path override
     group_column: str | None = None        # participants.tsv column for group comparisons
     make_figures: bool = True
+    overwrite_figures: bool = False
     event_seconds: list[float] | None = None
     tr_seconds: float | None = None
 
@@ -391,6 +392,144 @@ def _create_group_figures(
     return figure_paths
 
 
+def _compute_group_activation_averages(
+    subject_roi_paths: dict[str, Path],
+    kept_voxel_indices: np.ndarray,
+    subject_censor: dict[str, np.ndarray],
+    comparison_sets: dict[str, list[str]],
+    n_timepoints: int,
+) -> dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """Compute per-TR group-average activation from subject ROI timeseries.
+
+    Activation is the subject-wise mean across kept ROI voxels at each TR.
+    Censored TRs are treated as missing.
+    """
+    per_subject_activation: dict[str, np.ndarray] = {}
+    for subject, roi_path in subject_roi_paths.items():
+        roi_data = np.load(roi_path, mmap_mode="r")
+        roi_kept = np.asarray(roi_data[:, kept_voxel_indices], dtype=np.float32)
+        activation = np.mean(roi_kept, axis=1).astype(np.float32)
+        activation[~subject_censor[subject]] = np.nan
+        per_subject_activation[subject] = activation
+
+    out: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    for set_name, set_subjects in comparison_sets.items():
+        if not set_subjects:
+            continue
+        label = "all" if set_name == "full" else set_name
+        matrix = np.vstack([per_subject_activation[s] for s in set_subjects])
+
+        means = np.full(n_timepoints, np.nan)
+        sems = np.full(n_timepoints, np.nan)
+        counts = np.zeros(n_timepoints)
+
+        for tr in range(n_timepoints):
+            vals = matrix[:, tr]
+            valid = np.isfinite(vals)
+            n = int(np.sum(valid))
+            counts[tr] = n
+            if n > 0:
+                means[tr] = float(np.mean(vals[valid]))
+            if n >= 2:
+                sems[tr] = float(np.std(vals[valid], ddof=1) / np.sqrt(n))
+
+        out[label] = (means, sems, counts)
+
+    return out
+
+
+def _save_group_activation_averages_tsv(
+    activation_averages: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]],
+    out_path: Path,
+) -> None:
+    rows: list[dict[str, Any]] = []
+    for comparison_group, (means, sems, counts) in sorted(activation_averages.items()):
+        for tr_idx, (m, s, n) in enumerate(zip(means, sems, counts)):
+            if not np.isnan(m):
+                rows.append(
+                    {
+                        "comparison_group": comparison_group,
+                        "tr": tr_idx,
+                        "activation_mean": float(m),
+                        "activation_sem": float(s) if not np.isnan(s) else "",
+                        "n": int(n),
+                    }
+                )
+    pd.DataFrame(rows).to_csv(out_path, sep="\t", index=False, na_rep="")
+
+
+def _create_group_figures_with_activation(
+    averages: dict[str, dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]],
+    activation_averages: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]],
+    group_dir: Path,
+    roi_label: str,
+    approach: str,
+    event_seconds: list[float] | None = None,
+    tr_seconds: float | None = None,
+) -> list[Path]:
+    figure_paths: list[Path] = []
+    colors = {"within": "#1f77b4", "between": "#ff7f0e", "full": "#2ca02c"}
+
+    for comparison_group in sorted(averages.keys()):
+        type_dict = averages[comparison_group]
+        fig, ax = plt.subplots(figsize=(12, 6))
+        ax2 = ax.twinx()
+
+        for comparison_type in sorted(type_dict.keys()):
+            means, sems, _counts = type_dict[comparison_type]
+            trs = np.arange(len(means))
+            color = colors.get(comparison_type, "#999999")
+            ax.plot(trs, means, label=comparison_type, color=color, linewidth=2)
+            valid_sem = ~np.isnan(sems)
+            if np.any(valid_sem):
+                ax.fill_between(
+                    trs,
+                    np.where(valid_sem, means - sems, np.nan),
+                    np.where(valid_sem, means + sems, np.nan),
+                    alpha=0.2,
+                    color=color,
+                )
+
+        activation_tuple = activation_averages.get(comparison_group)
+        if activation_tuple is not None:
+            activation_means, _activation_sems, _activation_counts = activation_tuple
+            trs = np.arange(len(activation_means))
+            ax2.plot(
+                trs,
+                activation_means,
+                label="activation",
+                color="#111111",
+                linewidth=2,
+                alpha=0.9,
+            )
+
+        if event_seconds is not None and tr_seconds is not None and tr_seconds > 0:
+            for event_sec in event_seconds:
+                ax.axvline(event_sec / tr_seconds, color="gray", linestyle="--", alpha=0.3, linewidth=1)
+                ax.axvline((event_sec + 6.0) / tr_seconds, color="gray", linestyle="--", alpha=0.6, linewidth=1)
+
+        ax.set_xlabel("TR")
+        ax.set_ylabel("Pattern Correlation (ISPC)")
+        ax2.set_ylabel("Activation")
+        ax.set_title(
+            f"Inter-Subject Pattern Correlation + Activation: {comparison_group} group "
+            f"(ROI: {roi_label}, Approach: {approach})"
+        )
+        lines1, labels1 = ax.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax.legend(lines1 + lines2, labels1 + labels2)
+        ax.grid(True, alpha=0.3)
+
+        fig_path = group_dir / (
+            f"roi-{roi_label}_group-{comparison_group}_approach-{approach}_ispc_figure_with_activation.png"
+        )
+        fig.savefig(fig_path, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        figure_paths.append(fig_path)
+
+    return figure_paths
+
+
 # ---------------------------------------------------------------------------
 # Helpers: long-format conversion
 # ---------------------------------------------------------------------------
@@ -484,6 +623,7 @@ def run_ispc_analysis(
         brain_files=config_dict.get("brain_files"),
         group_column=config_dict.get("group_column"),
         make_figures=bool(config_dict.get("make_figures", True)),
+        overwrite_figures=bool(config_dict.get("overwrite_figures", False)),
         event_seconds=config_dict.get("event_seconds"),
         tr_seconds=config_dict.get("tr_seconds"),
     )
@@ -510,23 +650,37 @@ def run_ispc_analysis(
     metadata_path = group_dir / f"roi-{roi_label}_approach-{config.approach}_ispc_metadata.json"
     group_ts_path = group_dir / f"roi-{roi_label}_approach-{config.approach}_ispc_timeseries.tsv"
     group_avg_path = group_dir / f"roi-{roi_label}_approach-{config.approach}_ispc_group_averages.tsv"
+    activation_avg_path = group_dir / f"roi-{roi_label}_approach-{config.approach}_ispc_group_activation_averages.tsv"
     subject_ts_paths = [
         analysis_dir / s / f"{s}_roi-{roi_label}_approach-{config.approach}_ispc_timeseries.tsv"
         for s in subjects
     ]
 
-    required = [metadata_path, group_ts_path, *subject_ts_paths]
-    if config.make_figures:
-        required.append(group_avg_path)
+    core_required = [metadata_path, group_ts_path, *subject_ts_paths]
+    existing_base_figures = sorted(
+        group_dir.glob(f"roi-{roi_label}_group-*_approach-{config.approach}_ispc_figure.png")
+    )
+    existing_activation_figures = sorted(
+        group_dir.glob(
+            f"roi-{roi_label}_group-*_approach-{config.approach}_ispc_figure_with_activation.png"
+        )
+    )
+    figure_outputs_ready = (
+        group_avg_path.exists()
+        and activation_avg_path.exists()
+        and len(existing_base_figures) > 0
+        and len(existing_activation_figures) > 0
+    )
 
-    if not overwrite and all(p.exists() for p in required):
-        figure_paths = sorted(group_dir.glob(
-            f"roi-{roi_label}_group-*_approach-{config.approach}_ispc_figure.png"
-        ))
+    if not overwrite and all(p.exists() for p in core_required) and (
+        (not config.make_figures)
+        or (not config.overwrite_figures and figure_outputs_ready)
+    ):
         logger.info(
             "Cache hit: skipping ISPC for roi=%s, approach=%s (%d subjects)",
             config.roi_name, config.approach, len(subjects),
         )
+        figure_paths = sorted(existing_base_figures + existing_activation_figures)
         return {
             "analysis": "ispc",
             "status": "skipped_cache",
@@ -538,6 +692,7 @@ def run_ispc_analysis(
             "files": {
                 "group_timeseries": str(group_ts_path),
                 "group_averages": str(group_avg_path),
+                "group_activation_averages": str(activation_avg_path),
                 "metadata": str(metadata_path),
                 "figures": [str(p) for p in figure_paths],
             },
@@ -630,25 +785,6 @@ def run_ispc_analysis(
     comparison_sets = _build_comparison_sets(subjects=subjects, groups=groups)
     logger.info("Comparison sets: %s", sorted(comparison_sets.keys()))
 
-    # For LOSO, precompute per-set sum patterns and contributing subject counts at each TR.
-    loso_set_sums: dict[str, np.ndarray] = {}
-    loso_set_counts: dict[str, np.ndarray] = {}
-    if config.approach == "loso":
-        for set_name, set_subjects in comparison_sets.items():
-            set_sums = np.zeros((n_timepoints, n_voxels_kept), dtype=np.float32)
-            set_counts = np.zeros(n_timepoints, dtype=np.int32)
-
-            for set_subject in set_subjects:
-                roi_data = np.load(subject_roi_paths[set_subject], mmap_mode="r")
-                roi_kept = np.asarray(roi_data[:, kept_voxel_indices], dtype=np.float32)
-                valid = subject_censor[set_subject]
-                if np.any(valid):
-                    set_sums[valid] += roi_kept[valid]
-                    set_counts[valid] += 1
-
-            loso_set_sums[set_name] = set_sums
-            loso_set_counts[set_name] = set_counts
-
     # Initialise summary arrays.
     loso_summary: dict[str, dict[str, np.ndarray]] = {
         s: {sub: np.full(n_timepoints, np.nan) for sub in subjects}
@@ -687,116 +823,142 @@ def run_ispc_analysis(
             len(cached_subjects), len(subjects),
         )
 
-    # Per-subject ISPC computation.
-    for subject_index, subject in enumerate(subjects, start=1):
-        if subject in cached_subjects:
-            logger.info(
-                "Using cached ISPC for subject %d/%d: %s",
-                subject_index, len(subjects), subject,
-            )
-            continue
+    needs_compute_subjects = overwrite or (len(cached_subjects) < len(subjects))
 
-        logger.info("Computing ISPC for subject %d/%d: %s", subject_index, len(subjects), subject)
-        target_roi_data = np.load(subject_roi_paths[subject], mmap_mode="r")
-        target_data = np.asarray(target_roi_data[:, kept_voxel_indices], dtype=np.float32)
-        target_censor = subject_censor[subject]
-
+    # For LOSO, precompute per-set sum patterns only if we need new subject computations.
+    loso_set_sums: dict[str, np.ndarray] = {}
+    loso_set_counts: dict[str, np.ndarray] = {}
+    if needs_compute_subjects and config.approach == "loso":
         for set_name, set_subjects in comparison_sets.items():
-            comparison_subjects = [s for s in set_subjects if s != subject]
-            if not comparison_subjects:
+            set_sums = np.zeros((n_timepoints, n_voxels_kept), dtype=np.float32)
+            set_counts = np.zeros(n_timepoints, dtype=np.int32)
+
+            for set_subject in set_subjects:
+                roi_data = np.load(subject_roi_paths[set_subject], mmap_mode="r")
+                roi_kept = np.asarray(roi_data[:, kept_voxel_indices], dtype=np.float32)
+                valid = subject_censor[set_subject]
+                if np.any(valid):
+                    set_sums[valid] += roi_kept[valid]
+                    set_counts[valid] += 1
+
+            loso_set_sums[set_name] = set_sums
+            loso_set_counts[set_name] = set_counts
+
+    # Per-subject ISPC computation.
+    if needs_compute_subjects:
+        for subject_index, subject in enumerate(subjects, start=1):
+            if subject in cached_subjects:
+                logger.info(
+                    "Using cached ISPC for subject %d/%d: %s",
+                    subject_index, len(subjects), subject,
+                )
                 continue
 
-            if config.approach == "loso":
-                set_sums = loso_set_sums[set_name]
-                set_counts = loso_set_counts[set_name]
-                subject_in_set = subject in set_subjects
+            logger.info("Computing ISPC for subject %d/%d: %s", subject_index, len(subjects), subject)
+            target_roi_data = np.load(subject_roi_paths[subject], mmap_mode="r")
+            target_data = np.asarray(target_roi_data[:, kept_voxel_indices], dtype=np.float32)
+            target_censor = subject_censor[subject]
 
-                for tr in range(n_timepoints):
-                    if not target_censor[tr]:
-                        continue
+            for set_name, set_subjects in comparison_sets.items():
+                comparison_subjects = [s for s in set_subjects if s != subject]
+                if not comparison_subjects:
+                    continue
 
-                    subtract_self = subject_in_set and bool(target_censor[tr])
-                    n_other = int(set_counts[tr]) - (1 if subtract_self else 0)
-                    if n_other <= 0:
-                        continue
-
-                    if subtract_self:
-                        group_pattern = (set_sums[tr] - target_data[tr]) / float(n_other)
-                    else:
-                        group_pattern = set_sums[tr] / float(n_other)
-
-                    corr = _pearson_corr(target_data[tr], group_pattern)
-                    loso_summary[set_name][subject][tr] = corr
-
-            elif config.approach == "pairwise":
-                z_sums = np.zeros(n_timepoints, dtype=np.float64)
-                z_counts = np.zeros(n_timepoints, dtype=np.int32)
-
-                for cs in comparison_subjects:
-                    cs_roi_data = np.load(subject_roi_paths[cs], mmap_mode="r")
-                    cs_data = np.asarray(cs_roi_data[:, kept_voxel_indices], dtype=np.float32)
-                    cs_censor = subject_censor[cs]
+                if config.approach == "loso":
+                    set_sums = loso_set_sums[set_name]
+                    set_counts = loso_set_counts[set_name]
+                    subject_in_set = subject in set_subjects
 
                     for tr in range(n_timepoints):
                         if not target_censor[tr]:
                             continue
 
-                        if not cs_censor[tr]:
-                            fisher_z = float("nan")
+                        subtract_self = subject_in_set and bool(target_censor[tr])
+                        n_other = int(set_counts[tr]) - (1 if subtract_self else 0)
+                        if n_other <= 0:
+                            continue
+
+                        if subtract_self:
+                            group_pattern = (set_sums[tr] - target_data[tr]) / float(n_other)
                         else:
-                            corr = _pearson_corr(target_data[tr], cs_data[tr])
-                            fisher_z = _fisher_z(corr) if np.isfinite(corr) else float("nan")
+                            group_pattern = set_sums[tr] / float(n_other)
 
-                        pairwise_rows.append({
-                            "comparison_set": set_name,
-                            "target_subject": subject,
-                            "timepoint": tr,
-                            "comparison_subject": cs,
-                            "fisher_z": fisher_z,
-                        })
+                        corr = _pearson_corr(target_data[tr], group_pattern)
+                        loso_summary[set_name][subject][tr] = corr
 
-                        if np.isfinite(fisher_z):
-                            z_sums[tr] += fisher_z
-                            z_counts[tr] += 1
+                elif config.approach == "pairwise":
+                    z_sums = np.zeros(n_timepoints, dtype=np.float64)
+                    z_counts = np.zeros(n_timepoints, dtype=np.int32)
 
-                valid_mean = z_counts > 0
-                pairwise_summary[set_name][subject][valid_mean] = (
-                    z_sums[valid_mean] / z_counts[valid_mean]
-                )
+                    for cs in comparison_subjects:
+                        cs_roi_data = np.load(subject_roi_paths[cs], mmap_mode="r")
+                        cs_data = np.asarray(cs_roi_data[:, kept_voxel_indices], dtype=np.float32)
+                        cs_censor = subject_censor[cs]
 
-        # Write this subject's output immediately.
-        summary = loso_summary if config.approach == "loso" else pairwise_summary
-        subject_single = {
-            set_name: {subject: summary[set_name][subject]}
-            for set_name in comparison_sets
-        }
-        subject_long_df = _results_to_long_format(
-            subject_single, [subject], n_timepoints, groups, roi_label,
-        )
-        subject_dir = analysis_dir / subject
-        subject_dir.mkdir(parents=True, exist_ok=True)
-        subject_path = subject_dir / (
-            f"{subject}_roi-{roi_label}_approach-{config.approach}_ispc_timeseries.tsv"
-        )
-        subject_long_df.drop(columns=["subject"]).to_csv(
-            subject_path, sep="\t", index=False, na_rep=""
-        )
-        logger.info("Wrote subject ISPC file: %s", subject_path)
+                        for tr in range(n_timepoints):
+                            if not target_censor[tr]:
+                                continue
+
+                            if not cs_censor[tr]:
+                                fisher_z = float("nan")
+                            else:
+                                corr = _pearson_corr(target_data[tr], cs_data[tr])
+                                fisher_z = _fisher_z(corr) if np.isfinite(corr) else float("nan")
+
+                            pairwise_rows.append({
+                                "comparison_set": set_name,
+                                "target_subject": subject,
+                                "timepoint": tr,
+                                "comparison_subject": cs,
+                                "fisher_z": fisher_z,
+                            })
+
+                            if np.isfinite(fisher_z):
+                                z_sums[tr] += fisher_z
+                                z_counts[tr] += 1
+
+                    valid_mean = z_counts > 0
+                    pairwise_summary[set_name][subject][valid_mean] = (
+                        z_sums[valid_mean] / z_counts[valid_mean]
+                    )
+
+            # Write this subject's output immediately.
+            summary = loso_summary if config.approach == "loso" else pairwise_summary
+            subject_single = {
+                set_name: {subject: summary[set_name][subject]}
+                for set_name in comparison_sets
+            }
+            subject_long_df = _results_to_long_format(
+                subject_single, [subject], n_timepoints, groups, roi_label,
+            )
+            subject_dir = analysis_dir / subject
+            subject_dir.mkdir(parents=True, exist_ok=True)
+            subject_path = subject_dir / (
+                f"{subject}_roi-{roi_label}_approach-{config.approach}_ispc_timeseries.tsv"
+            )
+            subject_long_df.drop(columns=["subject"]).to_csv(
+                subject_path, sep="\t", index=False, na_rep=""
+            )
+            logger.info("Wrote subject ISPC file: %s", subject_path)
 
     # Group-level outputs.
-    active_summary = loso_summary if config.approach == "loso" else pairwise_summary
-    long_df = _results_to_long_format(
-        active_summary, subjects, n_timepoints, groups, roi_label
-    )
-
-    long_df.to_csv(group_ts_path, sep="\t", index=False, na_rep="")
-    logger.info("Wrote group ISPC timeseries: %s", group_ts_path)
+    if needs_compute_subjects or not group_ts_path.exists():
+        active_summary = loso_summary if config.approach == "loso" else pairwise_summary
+        long_df = _results_to_long_format(
+            active_summary, subjects, n_timepoints, groups, roi_label
+        )
+        long_df.to_csv(group_ts_path, sep="\t", index=False, na_rep="")
+        logger.info("Wrote group ISPC timeseries: %s", group_ts_path)
+    else:
+        long_df = pd.read_csv(group_ts_path, sep="\t")
+        logger.info("Using cached group ISPC timeseries: %s", group_ts_path)
 
     outputs: dict[str, Any] = {
         "analysis": "ispc",
         "roi_name": config.roi_name,
         "roi_label": roi_label,
         "approach": config.approach,
+        "status": "completed" if needs_compute_subjects else "reused_cached_correlations",
         "n_subjects": len(subjects),
         "n_timepoints": n_timepoints,
         "n_voxels": n_voxels_kept,
@@ -809,17 +971,67 @@ def run_ispc_analysis(
     }
 
     if config.make_figures:
+        activation_averages = _compute_group_activation_averages(
+            subject_roi_paths=subject_roi_paths,
+            kept_voxel_indices=kept_voxel_indices,
+            subject_censor=subject_censor,
+            comparison_sets=comparison_sets,
+            n_timepoints=n_timepoints,
+        )
+        _save_group_activation_averages_tsv(activation_averages, activation_avg_path)
+        outputs["files"]["group_activation_averages"] = str(activation_avg_path)
+
         averages = _compute_group_averages(long_df)
         _save_group_averages_tsv(averages, group_avg_path)
         outputs["files"]["group_averages"] = str(group_avg_path)
 
-        fig_paths = _create_group_figures(
-            averages, group_dir, roi_label, config.approach,
-            event_seconds=config.event_seconds,
-            tr_seconds=config.tr_seconds,
+        existing_base_figures = sorted(
+            group_dir.glob(f"roi-{roi_label}_group-*_approach-{config.approach}_ispc_figure.png")
         )
-        outputs["files"]["figures"] = [str(p) for p in fig_paths]
-        logger.info("Generated %d ISPC figures", len(fig_paths))
+        existing_activation_figures = sorted(
+            group_dir.glob(
+                f"roi-{roi_label}_group-*_approach-{config.approach}_ispc_figure_with_activation.png"
+            )
+        )
+        should_render_figures = (
+            needs_compute_subjects
+            or config.overwrite_figures
+            or len(existing_base_figures) == 0
+            or len(existing_activation_figures) == 0
+        )
+
+        if should_render_figures:
+            fig_paths = _create_group_figures(
+                averages,
+                group_dir,
+                roi_label,
+                config.approach,
+                event_seconds=config.event_seconds,
+                tr_seconds=config.tr_seconds,
+            )
+            fig_paths_with_activation = _create_group_figures_with_activation(
+                averages,
+                activation_averages,
+                group_dir,
+                roi_label,
+                config.approach,
+                event_seconds=config.event_seconds,
+                tr_seconds=config.tr_seconds,
+            )
+            outputs["files"]["figures"] = [str(p) for p in sorted(fig_paths + fig_paths_with_activation)]
+            logger.info(
+                "Generated %d ISPC figures (%d with activation overlay)",
+                len(fig_paths) + len(fig_paths_with_activation),
+                len(fig_paths_with_activation),
+            )
+            if not needs_compute_subjects:
+                outputs["status"] = "refreshed_figures"
+        else:
+            outputs["files"]["figures"] = [
+                str(p)
+                for p in sorted(existing_base_figures + existing_activation_figures)
+            ]
+            logger.info("Using cached ISPC figures")
 
     if config.approach == "pairwise" and pairwise_rows:
         pw_path = group_dir / f"desc-pairwise_roi-{roi_label}_ispc_details.tsv"
@@ -839,6 +1051,7 @@ def run_ispc_analysis(
             "brain_glob": config.brain_glob,
             "group_column": config.group_column,
             "make_figures": config.make_figures,
+            "overwrite_figures": config.overwrite_figures,
             "event_seconds": config.event_seconds,
             "tr_seconds": config.tr_seconds,
         },
