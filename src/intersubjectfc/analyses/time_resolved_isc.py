@@ -538,7 +538,7 @@ def _create_group_figures_with_activation(
         (len(means) for type_dict in averages.values() for means, _, _ in type_dict.values()),
         default=0,
     )
-    fig_width = max(12.0, n_trs_all * 0.075)
+    fig_width = max(12.0, n_trs_all * 0.025)
 
     colors = {"within": "#1f77b4", "between": "#ff7f0e", "full": "#2ca02c"}
 
@@ -626,7 +626,7 @@ def _create_group_figures(
     """
     figure_paths: list[Path] = []
 
-    # Scale figure width with dataset length: ~0.075 in/TR, minimum 12 in.
+    # Scale figure width with dataset length: ~0.025 in/TR, minimum 12 in.
     n_trs_all = max(
         (len(means) for type_dict in averages.values() for means, _, _ in type_dict.values()),
         default=0,

@@ -499,7 +499,7 @@ def _create_group_figures_with_activation(
         (len(means) for type_dict in averages.values() for means, _, _ in type_dict.values()),
         default=0,
     )
-    fig_width = max(12.0, n_trs_all * 0.075)
+    fig_width = max(12.0, n_trs_all * 0.025)
 
     for comparison_group in sorted(averages.keys()):
         type_dict = averages[comparison_group]
