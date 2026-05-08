@@ -33,6 +33,11 @@ class TimeResolvedISCConfig:
     make_figures: bool = True
     overwrite_figures: bool = False
     activation_shared_zero: bool = False
+    make_peak_outputs: bool = True
+    peak_smoothing_sigma_trs: float = 2.0
+    peak_min_prominence: float = 0.02
+    peak_min_distance_trs: int = 8
+    peak_hrf_offset_seconds: float = 6.0
     event_seconds: list[float] | None = None
     tr_seconds: float | None = None
 
@@ -522,6 +527,241 @@ def _align_twin_zero(ax: Any, ax2: Any) -> None:
     ax2.set_ylim(-f * new_span, (1.0 - f) * new_span)
 
 
+def _smooth_series_gaussian(values: np.ndarray, sigma_trs: float) -> np.ndarray:
+    """Gaussian smoothing with NaN-aware normalization."""
+    out = np.asarray(values, dtype=float).copy()
+    if sigma_trs <= 0:
+        return out
+
+    radius = max(1, int(math.ceil(3 * sigma_trs)))
+    offsets = np.arange(-radius, radius + 1, dtype=float)
+    kernel = np.exp(-0.5 * (offsets / sigma_trs) ** 2)
+    kernel /= np.sum(kernel)
+
+    valid = np.isfinite(out)
+    filled = np.where(valid, out, 0.0)
+    smoothed = np.convolve(filled, kernel, mode="same")
+    weights = np.convolve(valid.astype(float), kernel, mode="same")
+
+    result = np.full(out.shape, np.nan, dtype=float)
+    nonzero = weights > 1e-8
+    result[nonzero] = smoothed[nonzero] / weights[nonzero]
+    return result
+
+
+def _peak_prominence_window(smoothed: np.ndarray, peak_idx: int) -> dict[str, float | int]:
+    """Approximate peak prominence and base window without SciPy."""
+    peak_value = float(smoothed[peak_idx])
+
+    left_bound = 0
+    for idx in range(peak_idx - 1, -1, -1):
+        if np.isfinite(smoothed[idx]) and smoothed[idx] > peak_value:
+            left_bound = idx + 1
+            break
+
+    right_bound = len(smoothed) - 1
+    for idx in range(peak_idx + 1, len(smoothed)):
+        if np.isfinite(smoothed[idx]) and smoothed[idx] > peak_value:
+            right_bound = idx - 1
+            break
+
+    left_segment = smoothed[left_bound : peak_idx + 1]
+    right_segment = smoothed[peak_idx : right_bound + 1]
+    left_base_idx = left_bound + int(np.nanargmin(left_segment))
+    right_base_idx = peak_idx + int(np.nanargmin(right_segment))
+
+    left_base_val = float(smoothed[left_base_idx])
+    right_base_val = float(smoothed[right_base_idx])
+    contour = max(left_base_val, right_base_val)
+    prominence = peak_value - contour
+
+    return {
+        "peak_tr": peak_idx,
+        "peak_value_smoothed": peak_value,
+        "prominence": prominence,
+        "window_start_tr": left_base_idx,
+        "window_end_tr": right_base_idx,
+        "window_start_value": left_base_val,
+        "window_end_value": right_base_val,
+    }
+
+
+def _detect_prominent_peaks(
+    values: np.ndarray,
+    sigma_trs: float,
+    min_prominence: float,
+    min_distance_trs: int,
+) -> tuple[np.ndarray, list[dict[str, float | int]]]:
+    """Detect local maxima on a smoothed series and return prominence windows."""
+    smoothed = _smooth_series_gaussian(values, sigma_trs=sigma_trs)
+    candidates: list[dict[str, float | int]] = []
+
+    for idx in range(1, len(smoothed) - 1):
+        center = smoothed[idx]
+        left = smoothed[idx - 1]
+        right = smoothed[idx + 1]
+        if not (np.isfinite(center) and np.isfinite(left) and np.isfinite(right)):
+            continue
+        if not ((center >= left and center > right) or (center > left and center >= right)):
+            continue
+
+        peak_info = _peak_prominence_window(smoothed, idx)
+        if float(peak_info["prominence"]) < min_prominence:
+            continue
+        peak_info["peak_value_raw"] = float(values[idx]) if np.isfinite(values[idx]) else float("nan")
+        candidates.append(peak_info)
+
+    selected: list[dict[str, float | int]] = []
+    for peak_info in sorted(
+        candidates,
+        key=lambda item: (float(item["prominence"]), float(item["peak_value_smoothed"])),
+        reverse=True,
+    ):
+        peak_tr = int(peak_info["peak_tr"])
+        if any(abs(peak_tr - int(existing["peak_tr"])) < min_distance_trs for existing in selected):
+            continue
+        selected.append(peak_info)
+
+    selected.sort(key=lambda item: int(item["peak_tr"]))
+    return smoothed, selected
+
+
+def _seconds_from_tr(tr_idx: int | float, tr_seconds: float | None) -> float:
+    if tr_seconds is None:
+        return float("nan")
+    return float(tr_idx) * tr_seconds
+
+
+def _create_peak_outputs(
+    averages: dict[str, dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]],
+    analysis_dir: Path,
+    roi_label: str,
+    approach: str,
+    sigma_trs: float,
+    min_prominence: float,
+    min_distance_trs: int,
+    hrf_offset_seconds: float,
+    tr_seconds: float | None,
+) -> tuple[list[Path], Path]:
+    """Create smoothed peak-window figures and TSV export for group average traces."""
+    figure_paths: list[Path] = []
+    peak_rows: list[dict[str, Any]] = []
+    peak_columns = [
+        "comparison_group",
+        "comparison_type",
+        "peak_rank_in_time",
+        "peak_tr",
+        "peak_seconds",
+        "peak_value_raw",
+        "peak_value_smoothed",
+        "prominence",
+        "window_start_tr",
+        "window_end_tr",
+        "window_width_trs",
+        "window_start_seconds",
+        "window_end_seconds",
+        "window_width_seconds",
+        "recommended_hrf_offset_seconds",
+        "recommended_video_onset_seconds",
+        "recommended_video_offset_seconds",
+    ]
+    colors = {"within": "#1f77b4", "between": "#ff7f0e", "full": "#2ca02c"}
+
+    n_trs_all = max(
+        (len(means) for type_dict in averages.values() for means, _, _ in type_dict.values()),
+        default=0,
+    )
+    fig_width = max(12.0, n_trs_all * 0.075)
+
+    for comparison_group in sorted(averages.keys()):
+        type_dict = averages[comparison_group]
+        fig, ax = plt.subplots(figsize=(fig_width, 6))
+
+        for comparison_type in sorted(type_dict.keys()):
+            means, _sems, _counts = type_dict[comparison_type]
+            smoothed, peaks = _detect_prominent_peaks(
+                means,
+                sigma_trs=sigma_trs,
+                min_prominence=min_prominence,
+                min_distance_trs=min_distance_trs,
+            )
+            trs = np.arange(len(smoothed))
+            color = colors.get(comparison_type, "#999999")
+
+            for peak_rank, peak_info in enumerate(peaks, start=1):
+                window_start_tr = int(peak_info["window_start_tr"])
+                window_end_tr = int(peak_info["window_end_tr"])
+                peak_tr = int(peak_info["peak_tr"])
+                ax.axvspan(window_start_tr, window_end_tr, color=color, alpha=0.12)
+                ax.scatter(
+                    [peak_tr],
+                    [float(peak_info["peak_value_smoothed"])],
+                    color=color,
+                    s=28,
+                    zorder=4,
+                )
+
+                window_start_seconds = _seconds_from_tr(window_start_tr, tr_seconds)
+                window_end_seconds = _seconds_from_tr(window_end_tr, tr_seconds)
+                peak_seconds = _seconds_from_tr(peak_tr, tr_seconds)
+                peak_rows.append(
+                    {
+                        "comparison_group": comparison_group,
+                        "comparison_type": comparison_type,
+                        "peak_rank_in_time": peak_rank,
+                        "peak_tr": peak_tr,
+                        "peak_seconds": peak_seconds,
+                        "peak_value_raw": float(peak_info["peak_value_raw"]),
+                        "peak_value_smoothed": float(peak_info["peak_value_smoothed"]),
+                        "prominence": float(peak_info["prominence"]),
+                        "window_start_tr": window_start_tr,
+                        "window_end_tr": window_end_tr,
+                        "window_width_trs": window_end_tr - window_start_tr + 1,
+                        "window_start_seconds": window_start_seconds,
+                        "window_end_seconds": window_end_seconds,
+                        "window_width_seconds": (
+                            window_end_seconds - window_start_seconds
+                            if np.isfinite(window_start_seconds) and np.isfinite(window_end_seconds)
+                            else float("nan")
+                        ),
+                        "recommended_hrf_offset_seconds": hrf_offset_seconds,
+                        "recommended_video_onset_seconds": (
+                            max(0.0, window_start_seconds - hrf_offset_seconds)
+                            if np.isfinite(window_start_seconds)
+                            else float("nan")
+                        ),
+                        "recommended_video_offset_seconds": (
+                            max(0.0, window_end_seconds - hrf_offset_seconds)
+                            if np.isfinite(window_end_seconds)
+                            else float("nan")
+                        ),
+                    }
+                )
+
+            ax.plot(trs, smoothed, label=f"{comparison_type} (smoothed)", color=color, linewidth=2.2)
+
+        ax.set_xlabel("TR")
+        ax.set_ylabel("Smoothed Correlation (LOSO) or Mean Fisher-z (Pairwise)")
+        ax.set_title(
+            f"Time-Resolved ISC Peak Windows: {comparison_group} group "
+            f"(ROI: {roi_label}, Approach: {approach})"
+        )
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+        fig_path = analysis_dir / (
+            f"roi-{roi_label}_group-{comparison_group}_approach-{approach}_peak_windows.png"
+        )
+        fig.savefig(fig_path, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        figure_paths.append(fig_path)
+
+    peak_df = pd.DataFrame(peak_rows, columns=peak_columns)
+    peak_tsv_path = analysis_dir / f"roi-{roi_label}_approach-{approach}_peak_windows.tsv"
+    peak_df.to_csv(peak_tsv_path, sep="\t", index=False, na_rep="")
+    return figure_paths, peak_tsv_path
+
+
 def _create_group_figures_with_activation(
     averages: dict[str, dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]],
     activation_averages: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]],
@@ -746,6 +986,11 @@ def run_time_resolved_isc_analysis(
         make_figures=bool(config_dict.get("make_figures", True)),
         overwrite_figures=bool(config_dict.get("overwrite_figures", False)),
         activation_shared_zero=bool(config_dict.get("activation_shared_zero", False)),
+        make_peak_outputs=bool(config_dict.get("make_peak_outputs", True)),
+        peak_smoothing_sigma_trs=float(config_dict.get("peak_smoothing_sigma_trs", 2.0)),
+        peak_min_prominence=float(config_dict.get("peak_min_prominence", 0.02)),
+        peak_min_distance_trs=int(config_dict.get("peak_min_distance_trs", 8)),
+        peak_hrf_offset_seconds=float(config_dict.get("peak_hrf_offset_seconds", 6.0)),
         event_seconds=config_dict.get("event_seconds"),
         tr_seconds=config_dict.get("tr_seconds"),
     )
@@ -815,10 +1060,17 @@ def run_time_resolved_isc_analysis(
             existing_overlay_figs = sorted(
                 group_dir.glob(f"roi-{roi_label}_group-*_approach-{config.approach}_figure_with_activation.png")
             )
+            existing_peak_figs = sorted(
+                group_dir.glob(f"roi-{roi_label}_group-*_approach-{config.approach}_peak_windows.png")
+            )
+            peak_tsv_path = group_dir / f"roi-{roi_label}_approach-{config.approach}_peak_windows.tsv"
 
             needs_base = config.overwrite_figures or not existing_figs
             needs_overlay = config.overwrite_figures or not existing_overlay_figs
-            if needs_base or needs_overlay:
+            needs_peak_outputs = (
+                config.make_peak_outputs and (config.overwrite_figures or not existing_peak_figs or not peak_tsv_path.exists())
+            )
+            if needs_base or needs_overlay or needs_peak_outputs:
                 logger.info("Generating figures from cached averages for roi=%s", config.roi_name)
                 averages = _load_group_averages_tsv(group_averages_path)
 
@@ -910,22 +1162,44 @@ def run_time_resolved_isc_analysis(
                 else:
                     overlay_fig_paths = existing_overlay_figs
 
+                if config.make_peak_outputs:
+                    peak_fig_paths, peak_tsv_out = _create_peak_outputs(
+                        averages,
+                        group_dir,
+                        roi_label,
+                        config.approach,
+                        sigma_trs=config.peak_smoothing_sigma_trs,
+                        min_prominence=config.peak_min_prominence,
+                        min_distance_trs=config.peak_min_distance_trs,
+                        hrf_offset_seconds=config.peak_hrf_offset_seconds,
+                        tr_seconds=config.tr_seconds,
+                    )
+                else:
+                    peak_fig_paths = existing_peak_figs
+                    peak_tsv_out = peak_tsv_path
+
                 cached_outputs["status"] = "refreshed_figures"
                 logger.info(
-                    "Generated %d base figures and %d activation-overlay figures for roi=%s",
+                    "Generated %d base figures, %d activation-overlay figures, and %d peak-window figures for roi=%s",
                     len(fig_paths),
                     len(overlay_fig_paths),
+                    len(peak_fig_paths),
                     config.roi_name,
                 )
             else:
                 fig_paths = existing_figs
                 overlay_fig_paths = existing_overlay_figs
+                peak_fig_paths = existing_peak_figs
+                peak_tsv_out = peak_tsv_path
 
             cached_outputs["files"][f"{config.approach}_group_averages"] = str(group_averages_path)
             if activation_averages_path.exists():
                 cached_outputs["files"][f"{config.approach}_activation_averages"] = str(activation_averages_path)
             cached_outputs["files"][f"{config.approach}_figures"] = [str(p) for p in fig_paths]
             cached_outputs["files"][f"{config.approach}_figures_with_activation"] = [str(p) for p in overlay_fig_paths]
+            if config.make_peak_outputs:
+                cached_outputs["files"][f"{config.approach}_peak_figures"] = [str(p) for p in peak_fig_paths]
+                cached_outputs["files"][f"{config.approach}_peak_windows_tsv"] = str(peak_tsv_out)
         elif group_averages_path.exists():
             cached_outputs["files"][f"{config.approach}_group_averages"] = str(group_averages_path)
             if activation_averages_path.exists():
@@ -934,12 +1208,20 @@ def run_time_resolved_isc_analysis(
             existing_overlay_figs = sorted(
                 group_dir.glob(f"roi-{roi_label}_group-*_approach-{config.approach}_figure_with_activation.png")
             )
+            existing_peak_figs = sorted(
+                group_dir.glob(f"roi-{roi_label}_group-*_approach-{config.approach}_peak_windows.png")
+            )
+            peak_tsv_path = group_dir / f"roi-{roi_label}_approach-{config.approach}_peak_windows.tsv"
             if existing_figs:
                 cached_outputs["files"][f"{config.approach}_figures"] = [str(p) for p in existing_figs]
             if existing_overlay_figs:
                 cached_outputs["files"][f"{config.approach}_figures_with_activation"] = [
                     str(p) for p in existing_overlay_figs
                 ]
+            if config.make_peak_outputs and existing_peak_figs:
+                cached_outputs["files"][f"{config.approach}_peak_figures"] = [str(p) for p in existing_peak_figs]
+            if config.make_peak_outputs and peak_tsv_path.exists():
+                cached_outputs["files"][f"{config.approach}_peak_windows_tsv"] = str(peak_tsv_path)
 
         return cached_outputs
 
@@ -1225,6 +1507,32 @@ def run_time_resolved_isc_analysis(
                 logger.info("Using cached LOSO activation-overlay figures (%d)", len(overlay_fig_paths))
             outputs["files"]["loso_figures_with_activation"] = [str(p) for p in overlay_fig_paths]
 
+            existing_loso_peak_figs = sorted(
+                group_dir.glob(f"roi-{roi_label}_group-*_approach-loso_peak_windows.png")
+            )
+            loso_peak_tsv_path = group_dir / f"roi-{roi_label}_approach-loso_peak_windows.tsv"
+            if config.make_peak_outputs and (config.overwrite_figures or not existing_loso_peak_figs or not loso_peak_tsv_path.exists()):
+                loso_peak_fig_paths, loso_peak_tsv_out = _create_peak_outputs(
+                    averages,
+                    group_dir,
+                    roi_label,
+                    "loso",
+                    sigma_trs=config.peak_smoothing_sigma_trs,
+                    min_prominence=config.peak_min_prominence,
+                    min_distance_trs=config.peak_min_distance_trs,
+                    hrf_offset_seconds=config.peak_hrf_offset_seconds,
+                    tr_seconds=config.tr_seconds,
+                )
+                logger.info("Generated %d LOSO peak-window figures", len(loso_peak_fig_paths))
+            else:
+                loso_peak_fig_paths = existing_loso_peak_figs
+                loso_peak_tsv_out = loso_peak_tsv_path
+                if config.make_peak_outputs:
+                    logger.info("Using cached LOSO peak-window figures (%d)", len(loso_peak_fig_paths))
+            if config.make_peak_outputs:
+                outputs["files"]["loso_peak_figures"] = [str(p) for p in loso_peak_fig_paths]
+                outputs["files"]["loso_peak_windows_tsv"] = str(loso_peak_tsv_out)
+
     if config.approach == "pairwise":
         long_df = _results_to_long_format(
             pairwise_summary, subjects, n_timepoints, groups, roi_label
@@ -1291,6 +1599,32 @@ def run_time_resolved_isc_analysis(
                 logger.info("Using cached pairwise activation-overlay figures (%d)", len(overlay_fig_paths))
             outputs["files"]["pairwise_figures_with_activation"] = [str(p) for p in overlay_fig_paths]
 
+            existing_pw_peak_figs = sorted(
+                group_dir.glob(f"roi-{roi_label}_group-*_approach-pairwise_peak_windows.png")
+            )
+            pairwise_peak_tsv_path = group_dir / f"roi-{roi_label}_approach-pairwise_peak_windows.tsv"
+            if config.make_peak_outputs and (config.overwrite_figures or not existing_pw_peak_figs or not pairwise_peak_tsv_path.exists()):
+                pairwise_peak_fig_paths, pairwise_peak_tsv_out = _create_peak_outputs(
+                    averages,
+                    group_dir,
+                    roi_label,
+                    "pairwise",
+                    sigma_trs=config.peak_smoothing_sigma_trs,
+                    min_prominence=config.peak_min_prominence,
+                    min_distance_trs=config.peak_min_distance_trs,
+                    hrf_offset_seconds=config.peak_hrf_offset_seconds,
+                    tr_seconds=config.tr_seconds,
+                )
+                logger.info("Generated %d pairwise peak-window figures", len(pairwise_peak_fig_paths))
+            else:
+                pairwise_peak_fig_paths = existing_pw_peak_figs
+                pairwise_peak_tsv_out = pairwise_peak_tsv_path
+                if config.make_peak_outputs:
+                    logger.info("Using cached pairwise peak-window figures (%d)", len(pairwise_peak_fig_paths))
+            if config.make_peak_outputs:
+                outputs["files"]["pairwise_peak_figures"] = [str(p) for p in pairwise_peak_fig_paths]
+                outputs["files"]["pairwise_peak_windows_tsv"] = str(pairwise_peak_tsv_out)
+
         pairwise_path = group_dir / f"desc-pairwise_roi-{roi_label}_details.tsv"
         pairwise_df = pd.DataFrame(pairwise_rows)
         if not pairwise_df.empty:
@@ -1313,6 +1647,11 @@ def run_time_resolved_isc_analysis(
             "timecourse_files": config.timecourse_files,
             "make_figures": config.make_figures,
             "activation_shared_zero": config.activation_shared_zero,
+            "make_peak_outputs": config.make_peak_outputs,
+            "peak_smoothing_sigma_trs": config.peak_smoothing_sigma_trs,
+            "peak_min_prominence": config.peak_min_prominence,
+            "peak_min_distance_trs": config.peak_min_distance_trs,
+            "peak_hrf_offset_seconds": config.peak_hrf_offset_seconds,
             "event_seconds": config.event_seconds,
             "tr_seconds": config.tr_seconds,
         },
