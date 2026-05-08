@@ -724,13 +724,26 @@ def _create_peak_outputs(
                 window_start_tr = int(peak_info["window_start_tr"])
                 window_end_tr = int(peak_info["window_end_tr"])
                 peak_tr = int(peak_info["peak_tr"])
+                peak_value_smoothed = float(peak_info["peak_value_smoothed"])
                 ax.axvspan(window_start_tr, window_end_tr, color=color, alpha=0.12)
                 ax.scatter(
                     [peak_tr],
-                    [float(peak_info["peak_value_smoothed"])],
+                    [peak_value_smoothed],
                     color=color,
                     s=28,
                     zorder=4,
+                )
+                ax.annotate(
+                    str(peak_rank),
+                    xy=(peak_tr, peak_value_smoothed),
+                    xytext=(0, 8),
+                    textcoords="offset points",
+                    ha="center",
+                    va="bottom",
+                    color="black",
+                    fontsize=8,
+                    fontweight="bold",
+                    zorder=5,
                 )
 
                 window_start_seconds = _seconds_from_tr(window_start_tr, tr_seconds)
@@ -744,7 +757,7 @@ def _create_peak_outputs(
                         "peak_tr": peak_tr,
                         "peak_seconds": peak_seconds,
                         "peak_value_raw": float(peak_info["peak_value_raw"]),
-                        "peak_value_smoothed": float(peak_info["peak_value_smoothed"]),
+                        "peak_value_smoothed": peak_value_smoothed,
                         "prominence": float(peak_info["prominence"]),
                         "window_cutoff_value": float(peak_info["window_cutoff_value"]),
                         "window_rel_height": float(peak_info["window_rel_height"]),
