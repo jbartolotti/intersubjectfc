@@ -37,6 +37,7 @@ class TimeResolvedISCConfig:
     peak_smoothing_sigma_trs: float = 2.0
     peak_min_prominence: float = 0.02
     peak_min_distance_trs: int = 8
+    peak_window_rel_height: float = 0.5
     peak_hrf_offset_seconds: float = 6.0
     event_seconds: list[float] | None = None
     tr_seconds: float | None = None
@@ -549,8 +550,12 @@ def _smooth_series_gaussian(values: np.ndarray, sigma_trs: float) -> np.ndarray:
     return result
 
 
-def _peak_prominence_window(smoothed: np.ndarray, peak_idx: int) -> dict[str, float | int]:
-    """Approximate peak prominence and base window without SciPy."""
+def _peak_prominence_window(
+    smoothed: np.ndarray,
+    peak_idx: int,
+    rel_height: float,
+) -> dict[str, float | int]:
+    """Approximate peak prominence and a stricter within-prominence window without SciPy."""
     peak_value = float(smoothed[peak_idx])
 
     left_bound = 0
@@ -575,12 +580,32 @@ def _peak_prominence_window(smoothed: np.ndarray, peak_idx: int) -> dict[str, fl
     contour = max(left_base_val, right_base_val)
     prominence = peak_value - contour
 
+    width_height = peak_value - (prominence * rel_height)
+
+    window_start_idx = peak_idx
+    for idx in range(peak_idx, left_base_idx - 1, -1):
+        if not np.isfinite(smoothed[idx]) or smoothed[idx] < width_height:
+            window_start_idx = min(peak_idx, idx + 1)
+            break
+        window_start_idx = idx
+
+    window_end_idx = peak_idx
+    for idx in range(peak_idx, right_base_idx + 1):
+        if not np.isfinite(smoothed[idx]) or smoothed[idx] < width_height:
+            window_end_idx = max(peak_idx, idx - 1)
+            break
+        window_end_idx = idx
+
     return {
         "peak_tr": peak_idx,
         "peak_value_smoothed": peak_value,
         "prominence": prominence,
-        "window_start_tr": left_base_idx,
-        "window_end_tr": right_base_idx,
+        "window_start_tr": window_start_idx,
+        "window_end_tr": window_end_idx,
+        "base_start_tr": left_base_idx,
+        "base_end_tr": right_base_idx,
+        "window_cutoff_value": width_height,
+        "window_rel_height": rel_height,
         "window_start_value": left_base_val,
         "window_end_value": right_base_val,
     }
@@ -591,6 +616,7 @@ def _detect_prominent_peaks(
     sigma_trs: float,
     min_prominence: float,
     min_distance_trs: int,
+    window_rel_height: float,
 ) -> tuple[np.ndarray, list[dict[str, float | int]]]:
     """Detect local maxima on a smoothed series and return prominence windows."""
     smoothed = _smooth_series_gaussian(values, sigma_trs=sigma_trs)
@@ -605,7 +631,7 @@ def _detect_prominent_peaks(
         if not ((center >= left and center > right) or (center > left and center >= right)):
             continue
 
-        peak_info = _peak_prominence_window(smoothed, idx)
+        peak_info = _peak_prominence_window(smoothed, idx, rel_height=window_rel_height)
         if float(peak_info["prominence"]) < min_prominence:
             continue
         peak_info["peak_value_raw"] = float(values[idx]) if np.isfinite(values[idx]) else float("nan")
@@ -640,6 +666,7 @@ def _create_peak_outputs(
     sigma_trs: float,
     min_prominence: float,
     min_distance_trs: int,
+    window_rel_height: float,
     hrf_offset_seconds: float,
     tr_seconds: float | None,
 ) -> tuple[list[Path], Path]:
@@ -655,9 +682,13 @@ def _create_peak_outputs(
         "peak_value_raw",
         "peak_value_smoothed",
         "prominence",
+        "window_cutoff_value",
+        "window_rel_height",
         "window_start_tr",
         "window_end_tr",
         "window_width_trs",
+        "base_start_tr",
+        "base_end_tr",
         "window_start_seconds",
         "window_end_seconds",
         "window_width_seconds",
@@ -671,7 +702,7 @@ def _create_peak_outputs(
         (len(means) for type_dict in averages.values() for means, _, _ in type_dict.values()),
         default=0,
     )
-    fig_width = max(12.0, n_trs_all * 0.075)
+    fig_width = max(12.0, n_trs_all * 0.025)
 
     for comparison_group in sorted(averages.keys()):
         type_dict = averages[comparison_group]
@@ -684,6 +715,7 @@ def _create_peak_outputs(
                 sigma_trs=sigma_trs,
                 min_prominence=min_prominence,
                 min_distance_trs=min_distance_trs,
+                window_rel_height=window_rel_height,
             )
             trs = np.arange(len(smoothed))
             color = colors.get(comparison_type, "#999999")
@@ -714,9 +746,13 @@ def _create_peak_outputs(
                         "peak_value_raw": float(peak_info["peak_value_raw"]),
                         "peak_value_smoothed": float(peak_info["peak_value_smoothed"]),
                         "prominence": float(peak_info["prominence"]),
+                        "window_cutoff_value": float(peak_info["window_cutoff_value"]),
+                        "window_rel_height": float(peak_info["window_rel_height"]),
                         "window_start_tr": window_start_tr,
                         "window_end_tr": window_end_tr,
                         "window_width_trs": window_end_tr - window_start_tr + 1,
+                        "base_start_tr": int(peak_info["base_start_tr"]),
+                        "base_end_tr": int(peak_info["base_end_tr"]),
                         "window_start_seconds": window_start_seconds,
                         "window_end_seconds": window_end_seconds,
                         "window_width_seconds": (
@@ -990,6 +1026,7 @@ def run_time_resolved_isc_analysis(
         peak_smoothing_sigma_trs=float(config_dict.get("peak_smoothing_sigma_trs", 2.0)),
         peak_min_prominence=float(config_dict.get("peak_min_prominence", 0.02)),
         peak_min_distance_trs=int(config_dict.get("peak_min_distance_trs", 8)),
+        peak_window_rel_height=float(config_dict.get("peak_window_rel_height", 0.5)),
         peak_hrf_offset_seconds=float(config_dict.get("peak_hrf_offset_seconds", 6.0)),
         event_seconds=config_dict.get("event_seconds"),
         tr_seconds=config_dict.get("tr_seconds"),
@@ -1171,6 +1208,7 @@ def run_time_resolved_isc_analysis(
                         sigma_trs=config.peak_smoothing_sigma_trs,
                         min_prominence=config.peak_min_prominence,
                         min_distance_trs=config.peak_min_distance_trs,
+                        window_rel_height=config.peak_window_rel_height,
                         hrf_offset_seconds=config.peak_hrf_offset_seconds,
                         tr_seconds=config.tr_seconds,
                     )
@@ -1520,6 +1558,7 @@ def run_time_resolved_isc_analysis(
                     sigma_trs=config.peak_smoothing_sigma_trs,
                     min_prominence=config.peak_min_prominence,
                     min_distance_trs=config.peak_min_distance_trs,
+                    window_rel_height=config.peak_window_rel_height,
                     hrf_offset_seconds=config.peak_hrf_offset_seconds,
                     tr_seconds=config.tr_seconds,
                 )
@@ -1612,6 +1651,7 @@ def run_time_resolved_isc_analysis(
                     sigma_trs=config.peak_smoothing_sigma_trs,
                     min_prominence=config.peak_min_prominence,
                     min_distance_trs=config.peak_min_distance_trs,
+                    window_rel_height=config.peak_window_rel_height,
                     hrf_offset_seconds=config.peak_hrf_offset_seconds,
                     tr_seconds=config.tr_seconds,
                 )
@@ -1651,6 +1691,7 @@ def run_time_resolved_isc_analysis(
             "peak_smoothing_sigma_trs": config.peak_smoothing_sigma_trs,
             "peak_min_prominence": config.peak_min_prominence,
             "peak_min_distance_trs": config.peak_min_distance_trs,
+            "peak_window_rel_height": config.peak_window_rel_height,
             "peak_hrf_offset_seconds": config.peak_hrf_offset_seconds,
             "event_seconds": config.event_seconds,
             "tr_seconds": config.tr_seconds,
